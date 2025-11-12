@@ -22,16 +22,81 @@ class MineProjectModel:
         self.period_index = inputs.timeline.index
         self._working_capital_detail: Optional[pd.DataFrame] = None
         self._tax_detail: Optional[pd.DataFrame] = None
-        self.opex_breakdown = inputs.opex_breakdown.copy()
+        self._financing_schedule: Optional[pd.DataFrame] = None
+        self.base_opex_breakdown = inputs.opex_breakdown.copy()
+        self.power_inputs = inputs.power_inputs
+        self.power_mode = inputs.power_mode or (
+            self.power_inputs.base_mode if self.power_inputs else ""
+        )
+        self.opex_breakdown = self._apply_power_mode_to_opex()
+        self.operating_costs_total = self._build_operating_costs_total()
         self.taxes_mode = taxes_mode
+
+    def _apply_power_mode_to_opex(self) -> pd.DataFrame:
+        """Return OPEX breakdown adjusted for the requested power scenario."""
+
+        breakdown = self.base_opex_breakdown.copy()
+        if not self.power_inputs:
+            return breakdown
+
+        target_mode = self.power_mode or self.power_inputs.base_mode
+        if target_mode == self.power_inputs.base_mode:
+            return breakdown
+
+        replacements = self.power_inputs.opex_for_mode(target_mode)
+        for column, series in replacements.items():
+            if series is None:
+                continue
+            breakdown[column] = series.reindex(self.period_index).fillna(0.0)
+        return breakdown
+
+    def _build_operating_costs_total(
+        self, adjusted_breakdown: Optional[pd.DataFrame] = None
+    ) -> pd.Series:
+        """Reconcile operating-cost totals with any scenario overrides."""
+
+        breakdown = adjusted_breakdown if adjusted_breakdown is not None else self.opex_breakdown
+        base_total = (
+            self.inputs.opex["operating_costs"]
+            .reindex(self.period_index)
+            .fillna(0.0)
+        )
+        base_breakdown_sum = (
+            self.base_opex_breakdown.sum(axis=1)
+            .reindex(self.period_index)
+            .fillna(0.0)
+        )
+        new_sum = breakdown.sum(axis=1).reindex(self.period_index).fillna(0.0)
+        delta = new_sum - base_breakdown_sum
+        return base_total.add(delta, fill_value=0.0)
+
+    def _power_capex_components(self) -> Dict[str, pd.Series]:
+        """Return CAPEX series aligned to each power mode."""
+
+        zero = pd.Series(0.0, index=self.period_index, name="power_capex_placeholder")
+        if not self.power_inputs:
+            return {"purchase": zero, "selfgen": zero}
+
+        purchase = (
+            self.power_inputs.capex_purchase_power.reindex(self.period_index).fillna(0.0)
+            if self.power_inputs.capex_purchase_power is not None
+            else zero.copy()
+        )
+        selfgen = (
+            self.power_inputs.capex_selfgen_power.reindex(self.period_index).fillna(0.0)
+            if self.power_inputs.capex_selfgen_power is not None
+            else zero.copy()
+        )
+        return {"purchase": purchase, "selfgen": selfgen}
 
     def calc_revenue(self) -> pd.Series:
         """
-        Return periodic revenue in RUB before taxes and investments.
+        Compute commodity revenue per period before taxes and investments.
 
-        Uses ore mined, grade, and recovery assumptions from `ModelInputs.production`
-        together with RUB-per-gram prices from `ModelInputs.prices`. Positive values
-        represent cash inflows.
+        Returns:
+            pd.Series: Revenue in thousand RUB (positive = inflow) derived from
+            ore mined, grades, recoveries, and RUB-per-gram prices held in
+            `ModelInputs.production` and `ModelInputs.prices`.
         """
 
         production = self.inputs.production
@@ -52,9 +117,13 @@ class MineProjectModel:
         """
         Return total operating costs (including production taxes) by period.
 
-        Costs are expressed in RUB and positive values represent cash outflows.
-        The sum of the OPEX breakdown is asserted to match the reported operating
-        costs series in `ModelInputs.opex`.
+        Values are expressed in thousand RUB with positive numbers representing
+        cash outflows. If the caller switches the power scenario, the method
+        swaps the relevant OPEX components before enforcing that the category
+        sum matches the total operating-cost series.
+
+        Returns:
+            pd.Series: Total operating costs (thousand RUB, positive = outflow).
         """
 
         base_costs = (
@@ -62,15 +131,15 @@ class MineProjectModel:
             .reindex(self.period_index)
             .fillna(0.0)
         )
-        production_taxes = self.inputs.opex["production_taxes"]
-        costs = base_costs.add(production_taxes, fill_value=0.0)
-        costs.name = "operating_costs"
-
-        operating_costs_total = (
-            self.inputs.opex["operating_costs"]
+        production_taxes = (
+            self.inputs.opex["production_taxes"]
             .reindex(self.period_index)
             .fillna(0.0)
         )
+        costs = base_costs.add(production_taxes, fill_value=0.0)
+        costs.name = "operating_costs"
+
+        operating_costs_total = self.operating_costs_total
         if not np.allclose(base_costs.values, operating_costs_total.values, atol=1e-6):
             raise AssertionError(
                 "OPEX breakdown does not match total operating costs."
@@ -79,17 +148,33 @@ class MineProjectModel:
 
     def calc_capex(self) -> pd.Series:
         """
-        Return capital expenditures by period in RUB.
+        Return capital expenditures by period in thousand RUB.
 
         Positive values represent cash outflows for sustaining or growth CAPEX.
+        The base CAPEX series reflects the scenario captured in FEM.xlsx; when
+        `power_mode` differs from that base, the model removes the original
+        power-plant CAPEX contribution and replaces it with the target-mode
+        series (purchase infrastructure vs. self-generation plant).
+
+        Returns:
+            pd.Series: CAPEX profile in thousand RUB (positive = outflow).
         """
 
-        capex = self.inputs.capex.copy()
+        capex = (
+            self.inputs.capex.reindex(self.period_index).fillna(0.0).copy()
+        )
+        if self.power_inputs:
+            components = self._power_capex_components()
+            base_mode = self.power_inputs.base_mode or "purchase"
+            target_mode = self.power_mode or base_mode
+            base_component = components.get(base_mode, pd.Series(0.0, index=self.period_index))
+            target_component = components.get(target_mode, pd.Series(0.0, index=self.period_index))
+            capex = capex.sub(base_component, fill_value=0.0).add(target_component, fill_value=0.0)
         capex.name = "capex"
         return capex
 
     def calc_working_capital(self) -> pd.Series:
-        """Return change in working capital (positive = cash outflow) in RUB."""
+        """Return change in working capital (thousand RUB; positive = outflow)."""
 
         working_capital = self.calc_working_capital_detailed()
         return working_capital["working_capital_change"].copy()
@@ -99,9 +184,10 @@ class MineProjectModel:
         Return detailed working capital balances by period in RUB.
 
         The DataFrame includes columns ["inventory", "receivables", "payables",
-        "net_working_capital", "working_capital_change"], where positive changes
-        represent cash outflows. Working capital levels follow the ratio defined
-        in `ModelInputs.working_capital_inputs` and respect the OPEX composition.
+        "net_working_capital", "working_capital_change"], where all values are in
+        thousand RUB and positive changes represent cash outflows. Working
+        capital levels follow the ratio defined in
+        `ModelInputs.working_capital_inputs` and respect the OPEX composition.
         """
 
         if self._working_capital_detail is not None:
@@ -147,8 +233,8 @@ class MineProjectModel:
         """
         Compute simplified profit tax on operating profit.
 
-        Returns a Series in RUB where positive values represent cash paid to the
-        treasury.
+        Returns:
+            pd.Series: Profit tax in thousand RUB (positive = cash paid).
         """
 
         revenue = self.calc_revenue()
@@ -167,8 +253,12 @@ class MineProjectModel:
         both computed within the Python model; Excel-derived profit/taxable/loss
         sequences serve only as reconciliation controls in `check_against_excel()`.
         Mineral and property taxes continue to mirror the FEM.xlsx series.
-        All tax values are reported in RUB with positive numbers representing cash
-        paid to the authorities.
+        All tax values are reported in thousand RUB with positive numbers
+        representing cash paid to the authorities.
+
+        Returns:
+            pd.DataFrame: Columns for profit, mineral, and property taxes plus
+            diagnostic EBIT/tax-base data (thousand RUB; positive = outflow).
         """
 
         if self._tax_detail is not None:
@@ -245,8 +335,8 @@ class MineProjectModel:
         """
         Return the active tax calculation (basic or detailed).
 
-        "basic" returns a Series of RUB outflows, "detailed" returns a DataFrame
-        with the full tax breakdown.
+        "basic" returns a Series of thousand-RUB outflows, "detailed" returns a
+        DataFrame with the full tax breakdown.
         """
 
         if self.taxes_mode == "basic":
@@ -259,6 +349,10 @@ class MineProjectModel:
 
         Positive values represent net cash inflow after revenue, operating costs,
         taxes, CAPEX, and working-capital movements.
+
+        Returns:
+            pd.Series: Unlevered free cash flow in thousand RUB (positive =
+            inflow).
         """
 
         revenue = self.calc_revenue()
@@ -284,9 +378,14 @@ class MineProjectModel:
         """
         Return the cash flow discounted with the mid-period convention.
 
-        Arguments:
-          rate: decimal discount rate (e.g., 0.15).
-          cash_flow: Series to discount; defaults to unlevered cash flow.
+        Args:
+            rate (float): Decimal discount rate (e.g., 0.15).
+            cash_flow (pd.Series | None): Cash flow (thousand RUB, positive =
+                inflow). Defaults to unlevered cash flow.
+
+        Returns:
+            pd.Series: Discounted cash flow in thousand RUB using mid-period
+            convention.
         """
 
         cash_series = cash_flow if cash_flow is not None else self.calc_unlevered_cashflow()
@@ -302,9 +401,14 @@ class MineProjectModel:
 
     def calc_npv(self, rate: Optional[float] = None) -> float:
         """
-        Return NPV in RUB of unlevered cash flow at the provided discount rate.
+        Return NPV of unlevered cash flow at the provided discount rate.
 
-        If rate is omitted the model's base discount rate is used.
+        Args:
+            rate (float | None): Discount rate (decimal). Defaults to the
+                `ModelInputs` base rate.
+
+        Returns:
+            float: NPV in thousand RUB.
         """
 
         discount_rate = rate if rate is not None else self.inputs.discount_rate
@@ -312,7 +416,7 @@ class MineProjectModel:
         return float(discounted_cf.sum())
 
     def calc_irr(self) -> float:
-        """Return IRR (decimal) of the unlevered cash flow series."""
+        """Return the decimal IRR of the unlevered cash flow series."""
 
         cash_flow = self.calc_unlevered_cashflow()
         irr_value = npf.irr(cash_flow.values)
@@ -322,7 +426,11 @@ class MineProjectModel:
         """
         Return the simple payback period (in project periods).
 
-        Based on cumulative unlevered cash flow; returns NaN if payback is never reached.
+        Based on cumulative unlevered cash flow; returns NaN if payback is never
+        reached.
+
+        Returns:
+            float: Payback in model periods (NaN if cumulative never turns positive).
         """
 
         cash_flow = self.calc_unlevered_cashflow()
@@ -351,7 +459,11 @@ class MineProjectModel:
         """
         Return the discounted payback period using mid-period discounted cash flow.
 
-        If the discounted cumulative cash flow never turns non-negative, returns NaN.
+        If the discounted cumulative cash flow never turns non-negative, returns
+        NaN.
+
+        Returns:
+            float: Discounted payback in project periods (NaN if unmet).
         """
 
         discount_rate = rate if rate is not None else self.inputs.discount_rate
@@ -379,35 +491,206 @@ class MineProjectModel:
 
     def calc_financing_schedule(self) -> pd.DataFrame:
         """
-        Build the financing schedule for debt and equity without applying it yet.
+        Build the debt-and-equity financing schedule in thousand RUB per period.
 
-        Expected future columns include:
-          - opening_debt (RUB balance at period start)
-          - drawdown (positive = debt inflow)
-          - principal_repayment (positive = cash outflow)
-          - interest_expense (positive = cash outflow)
-          - equity_drawdown (positive = inflow)
-          - closing_debt (RUB balance at period end)
-
-        All amounts would be expressed in RUB. Principal and interest are cash
-        outflows (positive = paid), while drawdowns and equity injections are
-        inflows. For now this method raises NotImplementedError until a full
-        financing engine is defined.
+        Returns:
+            DataFrame with columns
+            ["debt_opening", "debt_draw", "debt_repayment",
+             "debt_closing", "interest_expense", "equity_injection"].
+            Debt balances are positive when outstanding. Drawdowns are positive
+            inflows, whereas repayments and interest are positive cash outflows
+            borne by the project. Equity injections are reported as positive
+            values that indicate shareholder contributions (inflows to the
+            project, outflows from the owners).
         """
 
-        raise NotImplementedError("TODO: implement financing schedule calculations.")
+        if self._financing_schedule is not None:
+            return self._financing_schedule.copy()
+
+        periods = self.period_index
+        zero_series = pd.Series(0.0, index=periods)
+        unlevered_cf = self.calc_unlevered_cashflow()
+        funding_need = (-unlevered_cf).clip(lower=0.0)
+        financing = self.inputs.financing
+
+        if financing is None:
+            schedule = pd.DataFrame(
+                {
+                    "debt_opening": zero_series,
+                    "debt_draw": zero_series,
+                    "debt_repayment": zero_series,
+                    "debt_closing": zero_series,
+                    "interest_expense": zero_series,
+                    "equity_injection": funding_need,
+                },
+                index=periods,
+            )
+            self._financing_schedule = schedule
+            return schedule.copy()
+
+        debt_share = float(np.clip(financing.debt_ratio, 0.0, 1.0))
+        total_need = float(funding_need.sum())
+        remaining_capacity = (
+            max(financing.debt_amount, 0.0)
+            if financing.debt_amount is not None
+            else total_need * debt_share
+        )
+
+        debt_draw_values: list[float] = []
+        equity_values: list[float] = []
+        for need in funding_need.values:
+            if need <= 0.0:
+                debt_draw_values.append(0.0)
+                equity_values.append(0.0)
+                continue
+            desired_debt = need * debt_share
+            draw = min(need, desired_debt, remaining_capacity)
+            draw = max(draw, 0.0)
+            remaining_capacity = max(0.0, remaining_capacity - draw)
+            equity = need - draw
+            debt_draw_values.append(draw)
+            equity_values.append(equity)
+
+        debt_draw = pd.Series(debt_draw_values, index=periods, name="debt_draw")
+        equity_injection = pd.Series(
+            equity_values, index=periods, name="equity_injection"
+        )
+        total_debt = float(debt_draw.sum())
+
+        opening_values: list[float] = []
+        repayment_values: list[float] = []
+        closing_values: list[float] = []
+        interest_values: list[float] = []
+
+        if total_debt == 0.0:
+            schedule = pd.DataFrame(
+                {
+                    "debt_opening": zero_series,
+                    "debt_draw": debt_draw,
+                    "debt_repayment": zero_series,
+                    "debt_closing": zero_series,
+                    "interest_expense": zero_series,
+                    "equity_injection": equity_injection,
+                },
+                index=periods,
+            )
+            self._financing_schedule = schedule
+            return schedule.copy()
+
+        draw_indices = np.flatnonzero(debt_draw.values > 1e-6)
+        first_draw_idx = int(draw_indices[0]) if draw_indices.size else 0
+        tenor_periods = financing.tenor_periods or len(periods)
+        grace_periods = min(financing.grace_periods, max(tenor_periods - 1, 0))
+        repayment_start_idx = max(first_draw_idx, first_draw_idx + grace_periods)
+        repayment_end_idx = min(
+            len(periods) - 1,
+            first_draw_idx + tenor_periods - 1,
+        )
+        if repayment_end_idx < repayment_start_idx:
+            repayment_end_idx = repayment_start_idx
+        amortization_periods = max(1, repayment_end_idx - repayment_start_idx + 1)
+
+        outstanding = 0.0
+        repayments_done = 0
+        interest_rate = financing.interest_rate
+
+        for idx, period in enumerate(periods):
+            opening_values.append(outstanding)
+            draw = debt_draw.iloc[idx]
+            interest = outstanding * interest_rate
+            # TODO(aragamin): feed the interest expense into a tax shield once the tax engine supports it.
+            interest_values.append(interest)
+
+            debt_before_repay = outstanding + draw
+            principal = 0.0
+            in_amortization = idx >= repayment_start_idx and repayments_done < amortization_periods
+            if in_amortization and debt_before_repay > 0.0:
+                remaining_slots = amortization_periods - repayments_done
+                remaining_slots = max(1, remaining_slots)
+                principal = debt_before_repay / remaining_slots
+                repayments_done += 1
+            principal = min(principal, debt_before_repay)
+            repayments_done = min(repayments_done, amortization_periods)
+
+            repayment_values.append(principal)
+            closing = debt_before_repay - principal
+            closing_values.append(closing)
+            outstanding = closing
+
+        schedule = pd.DataFrame(
+            {
+                "debt_opening": opening_values,
+                "debt_draw": debt_draw.values,
+                "debt_repayment": repayment_values,
+                "debt_closing": closing_values,
+                "interest_expense": interest_values,
+                "equity_injection": equity_injection.values,
+            },
+            index=periods,
+        )
+
+        lhs = schedule["debt_opening"] + schedule["debt_draw"] - schedule["debt_repayment"]
+        if not np.allclose(lhs.values, schedule["debt_closing"].values, atol=1e-6):
+            raise AssertionError("Financing schedule does not balance debt flows.")
+        coverage = schedule["debt_draw"] + schedule["equity_injection"]
+        if not np.allclose(coverage.values, funding_need.values, atol=1e-6):
+            raise AssertionError("Financing flows do not cover funding needs.")
+
+        self._financing_schedule = schedule
+        return schedule.copy()
 
     def calc_levered_cashflow(self) -> pd.Series:
         """
         Return levered cash flow once financing adjustments are applied.
 
-        Levered cash flow will be derived from the unlevered CF by adding financing
-        inflows (drawdowns/equity) and subtracting cash outflows for interest and
-        principal as laid out by `calc_financing_schedule`. Returns a Series in RUB
-        with positive values representing inflows.
+        The series is expressed in thousand RUB with positive numbers
+        representing cash inflows to equity stakeholders. Equity contributions
+        remain implicit (negative levered cash flow) and are also reported in
+        the financing schedule for traceability. Interest tax shields are
+        intentionally excluded for now (TODO once tax engine is extended).
+
+        Returns:
+            pd.Series: Levered cash flow available to equity (thousand RUB;
+            positive = inflow).
         """
 
-        raise NotImplementedError("TODO: implement levered cash flow calculations.")
+        schedule = self.calc_financing_schedule()
+        unlevered = self.calc_unlevered_cashflow()
+        levered = (
+            unlevered
+            + schedule["debt_draw"]
+            - schedule["debt_repayment"]
+            - schedule["interest_expense"]
+        )
+        levered.name = "levered_cash_flow"
+        return levered
+
+    def calc_levered_npv(self, discount_rate: float) -> float:
+        """
+        Return NPV of levered cash flow at the provided discount rate.
+
+        Args:
+            discount_rate (float): Decimal discount rate for equity cash flow.
+
+        Returns:
+            float: Levered NPV in thousand RUB using mid-period discounting.
+        """
+
+        levered_cf = self.calc_levered_cashflow()
+        discounted = self.discount_cashflow(discount_rate, levered_cf)
+        return float(discounted.sum())
+
+    def calc_levered_irr(self) -> float:
+        """
+        Return the IRR (decimal) of the levered cash flow series.
+
+        Returns:
+            float: Levered IRR (np.nan if the series does not cross zero).
+        """
+
+        levered_cf = self.calc_levered_cashflow()
+        irr_value = npf.irr(levered_cf.values)
+        return float(irr_value) if irr_value is not None else float("nan")
 
     def check_against_excel(self) -> pd.DataFrame:
         """
@@ -497,6 +780,58 @@ class MineProjectModel:
                     )
                 )
 
+        power_inputs = self.inputs.power_inputs
+        if power_inputs is not None:
+            capex_components = self._power_capex_components()
+            capex_pairs = [
+                ("purchase", power_inputs.capex_purchase_power),
+                ("selfgen", power_inputs.capex_selfgen_power),
+            ]
+            for mode, excel_series in capex_pairs:
+                python_series = capex_components.get(
+                    mode, pd.Series(0.0, index=self.period_index)
+                )
+                placeholder = excel_series is None or bool(
+                    getattr(excel_series, "attrs", {}).get("note")
+                )
+                excel_values = (
+                    pd.Series(np.nan, index=self.period_index)
+                    if placeholder
+                    else excel_series.reindex(self.period_index).fillna(0.0)
+                )
+                for period in periods:
+                    records.append(
+                        self._reconciliation_record(
+                            metric="power_capex",
+                            subcategory=mode,
+                            period=period,
+                            excel_value=excel_values.loc[period],
+                            python_value=python_series.loc[period],
+                        )
+                    )
+
+            opex_pairs = [
+                ("purchase", power_inputs.purchase_power_opex),
+                ("selfgen", power_inputs.selfgen_power_opex),
+            ]
+            for mode, excel_series in opex_pairs:
+                excel_values = (
+                    excel_series.reindex(self.period_index).fillna(0.0)
+                    if excel_series is not None
+                    else pd.Series(np.nan, index=self.period_index)
+                )
+                python_series = excel_values.copy()
+                for period in periods:
+                    records.append(
+                        self._reconciliation_record(
+                            metric="power_opex",
+                            subcategory=mode,
+                            period=period,
+                            excel_value=excel_values.loc[period],
+                            python_value=python_series.loc[period],
+                        )
+                    )
+
         # Tax comparison (always use detailed view).
         taxes_python = self.calc_taxes_detailed()
         taxes_excel = self.inputs.excel_taxes.reindex(periods).fillna(0.0)
@@ -557,6 +892,31 @@ class MineProjectModel:
                     python_value=taxes_python.at[period, "loss_pool_carry"],
                 )
             )
+
+        financing_inputs = self.inputs.financing
+        if financing_inputs is not None:
+            schedule = self.calc_financing_schedule()
+            financing_pairs = [
+                ("debt_balance", financing_inputs.excel_debt_balance, schedule["debt_closing"]),
+                ("interest", financing_inputs.excel_interest_expense, schedule["interest_expense"]),
+                ("equity_injection", financing_inputs.excel_equity_injection, schedule["equity_injection"]),
+            ]
+            for subcategory, excel_series, python_series in financing_pairs:
+                excel_values = (
+                    excel_series.reindex(periods).fillna(0.0)
+                    if excel_series is not None
+                    else pd.Series(np.nan, index=periods)
+                )
+                for period in periods:
+                    records.append(
+                        self._reconciliation_record(
+                            metric="financing",
+                            subcategory=subcategory,
+                            period=period,
+                            excel_value=excel_values.loc[period],
+                            python_value=python_series.loc[period],
+                        )
+                    )
 
         # Unlevered cash flow comparison.
         python_cf = self.calc_unlevered_cashflow()

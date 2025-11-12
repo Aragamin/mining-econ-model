@@ -15,6 +15,8 @@ def main() -> None:
     irr = model.calc_irr()
     payback = model.calc_payback()
     discounted_payback = model.calc_discounted_payback()
+    levered_npv = model.calc_levered_npv(inputs.discount_rate)
+    levered_irr = model.calc_levered_irr()
 
     print("Mine project metrics (base case):")
     print(f"  Scenario: {inputs.scenario}")
@@ -25,6 +27,8 @@ def main() -> None:
     print("  IRR: {:.2%}".format(irr))
     print("  Payback (periods): {:.2f}".format(payback))
     print("  Discounted Payback (periods): {:.2f}".format(discounted_payback))
+    print("  Levered NPV: {:,.0f} thousand RUB".format(levered_npv))
+    print("  Levered IRR: {:.2%}".format(levered_irr))
     print()
     print("Unlevered cash flow by period (thousand RUB):")
     print(unlevered_cf.round(2))

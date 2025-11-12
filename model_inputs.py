@@ -12,6 +12,7 @@ DATA_PATH = Path(__file__).resolve().parent / "data" / "FEM.xlsx"
 OPEX_CATEGORY_MAP = {
     "Шары для мельниц": "processing_consumables",
     "Конвейерная лента": "processing_consumables",
+    "Электроэнергия (выбранный вариант)": "power_purchase",
     "Дизельное топливо (выбранный вариант)": "fuel",
     "Масла и смазки": "lubricants",
     "Аммиачная селитра": "explosives",
@@ -56,6 +57,74 @@ class WorkingCapitalInputs:
 
 
 @dataclass
+class PowerInputs:
+    """
+    Encapsulate purchase-vs-self-generation power assumptions.
+
+    All monetary values are expressed in thousand RUB per period to stay aligned
+    with the FEM workbook, while consumption volumes follow the workbook units
+    (MWh per year for electricity, tonnes per year for diesel).
+    """
+
+    scenario_label: str
+    base_mode: str
+    electricity_price_thousand_rub_per_mwh: float
+    diesel_price_thousand_rub_per_ton: float
+    electricity_variants: Dict[str, float]
+    diesel_variants: Dict[str, float]
+    purchase_power_opex: pd.Series
+    selfgen_power_opex: pd.Series
+    purchase_diesel_opex: pd.Series
+    selfgen_diesel_opex: pd.Series
+    capex_purchase_power: Optional[pd.Series] = None
+    capex_selfgen_power: Optional[pd.Series] = None
+
+    def opex_for_mode(self, mode: Optional[str] = None) -> Dict[str, pd.Series]:
+        """Return replacement OPEX series for the requested power mode."""
+
+        normalized = _normalize_power_mode(mode or self.base_mode)
+        if normalized == "selfgen":
+            return {
+                "power_purchase": self.selfgen_power_opex,
+                "fuel": self.selfgen_diesel_opex,
+            }
+        return {
+            "power_purchase": self.purchase_power_opex,
+            "fuel": self.purchase_diesel_opex,
+        }
+
+    def capex_for_mode(self, mode: Optional[str] = None) -> Optional[pd.Series]:
+        """Return CAPEX adjustments for the requested power mode if available."""
+
+        normalized = _normalize_power_mode(mode or self.base_mode)
+        if normalized == "selfgen":
+            return self.capex_selfgen_power
+        return self.capex_purchase_power
+
+
+@dataclass
+class FinancingInputs:
+    """
+    Structured financing parameters extracted from FEM.xlsx.
+
+    Monetary series use thousand RUB units to stay consistent with source data.
+    Ratios are expressed in decimal form (0.15 = 15%).
+    """
+
+    interest_rate: float
+    equity_ratio: float
+    debt_ratio: float
+    tenor_periods: int
+    grace_periods: int
+    debt_amount: Optional[float]
+    excel_debt_draw: pd.Series
+    excel_debt_repayment: pd.Series
+    excel_debt_balance: pd.Series
+    excel_interest_expense: pd.Series
+    excel_equity_injection: pd.Series
+
+
+@dataclass
 class ModelInputs:
     """Container with structured inputs required by MineProjectModel."""
 
@@ -71,6 +140,9 @@ class ModelInputs:
     discount_rate: float
     profit_tax_rate: float
     scenario: str
+    power_mode: str
+    power_inputs: Optional[PowerInputs]
+    financing: Optional[FinancingInputs]
     excel_revenue: pd.Series
     excel_opex_total: pd.Series
     excel_working_capital_change: pd.Series
@@ -98,6 +170,9 @@ class ModelInputs:
             "discount_rate": self.discount_rate,
             "profit_tax_rate": self.profit_tax_rate,
             "scenario": self.scenario,
+            "power_mode": self.power_mode,
+            "power_inputs": self.power_inputs,
+            "financing": self.financing,
             "excel_revenue": self.excel_revenue.copy(),
             "excel_opex_total": self.excel_opex_total.copy(),
             "excel_working_capital_change": self.excel_working_capital_change.copy(),
@@ -119,9 +194,11 @@ def load_model_inputs(excel_path: Optional[Path] = None) -> ModelInputs:
     path = Path(excel_path) if excel_path else DATA_PATH
     inputs_sheet = pd.read_excel(path, sheet_name="Исходные данные")
     calendar_sheet = pd.read_excel(path, sheet_name="Горный календарь")
+    financing_sheet = pd.read_excel(path, sheet_name="Финансирование")
     opex_sheet = pd.read_excel(path, sheet_name="OPEX")
     taxes_sheet = pd.read_excel(path, sheet_name="Налоги")
     cashflow_sheet = pd.read_excel(path, sheet_name="Cash Flow")
+    capex_sheet = pd.read_excel(path, sheet_name="CAPEX")
 
     timeline, period_index, value_columns = _load_timeline(inputs_sheet)
 
@@ -129,6 +206,18 @@ def load_model_inputs(excel_path: Optional[Path] = None) -> ModelInputs:
     prices, discount_rate, profit_tax_rate, scenario = _load_prices_and_rates(
         inputs_sheet, period_index, value_columns
     )
+    power_inputs: Optional[PowerInputs] = None
+    try:
+        power_inputs = _load_power_inputs(
+            inputs_sheet, capex_sheet, period_index, value_columns, scenario
+        )
+    except Exception as exc:  # pragma: no cover - defensive guard
+        power_inputs = None
+        power_mode = _normalize_power_mode(scenario)
+        power_error = str(exc)
+    else:
+        power_mode = power_inputs.base_mode
+        power_error = None
 
     cashflow_data = _load_cashflow_data(
         cashflow_sheet, period_index, value_columns
@@ -148,6 +237,15 @@ def load_model_inputs(excel_path: Optional[Path] = None) -> ModelInputs:
     )
     excel_profit_loss_period = tax_data["profit_loss_period"]
     excel_profit_loss_cumulative = tax_data["profit_loss_cumulative"]
+    financing_inputs: Optional[FinancingInputs] = None
+    financing_error = None
+    try:
+        financing_inputs = _load_financing_inputs(
+            financing_sheet, period_index, value_columns
+        )
+    except Exception as exc:  # pragma: no cover - defensive guard
+        financing_inputs = None
+        financing_error = str(exc)
 
     if profit_tax_rate == 0.0:
         excel_taxable_profit_base = pd.Series(
@@ -165,7 +263,11 @@ def load_model_inputs(excel_path: Optional[Path] = None) -> ModelInputs:
     excel_loss_pool = (-excel_profit_loss_cumulative).clip(lower=0.0)
     excel_loss_pool.name = "excel_loss_pool"
 
-    metadata = {"source_file": str(path)}
+    metadata: Dict[str, Any] = {"source_file": str(path)}
+    if power_error:
+        metadata["power_inputs_warning"] = power_error
+    if financing_error:
+        metadata["financing_warning"] = financing_error
     return ModelInputs(
         timeline=timeline,
         production=production,
@@ -179,6 +281,9 @@ def load_model_inputs(excel_path: Optional[Path] = None) -> ModelInputs:
         discount_rate=discount_rate,
         profit_tax_rate=profit_tax_rate,
         scenario=scenario,
+        power_mode=power_mode,
+        power_inputs=power_inputs,
+        financing=financing_inputs,
         excel_revenue=cashflow_data["revenue"],
         excel_opex_total=cashflow_data["opex_total"],
         excel_working_capital_change=cashflow_data["working_capital_change"],
@@ -316,6 +421,144 @@ def _load_prices_and_rates(
         scenario = str(scenario_values.iloc[0]) if not scenario_values.empty else ""
 
     return prices, discount_rate, profit_tax_rate, scenario
+
+
+def _normalize_power_mode(raw: str) -> str:
+    """Map verbose scenario names to the simplified purchase/selfgen literals."""
+
+    if not raw:
+        return "purchase"
+    normalized = raw.strip().lower()
+    if "self" in normalized or "собствен" in normalized:
+        return "selfgen"
+    if "покуп" in normalized or "purchase" in normalized:
+        return "purchase"
+    return "purchase"
+
+
+def _load_power_inputs(
+    inputs_sheet: pd.DataFrame,
+    capex_sheet: pd.DataFrame,
+    period_index: pd.Index,
+    value_columns: Iterable[str],
+    scenario: str,
+) -> PowerInputs:
+    label_col = _normalized_column(inputs_sheet, "Unnamed: 3")
+
+    def _scalar(label: str, unit: Optional[str] = None) -> float:
+        series = _extract_series(
+            inputs_sheet, label_col, value_columns, period_index, label, unit
+        )
+        return float(series.iloc[0])
+
+    electricity_price = _scalar("Электроэнергия", "тыс. руб./МВатт*ч")
+    diesel_price = _scalar("Дизельное топливо", "тыс. руб./т")
+    electricity_selected = _scalar("Электроэнергия (выбранный вариант)", "МВатт*ч/год")
+    electricity_variant_1 = _scalar("Электроэнергия (вариант 1)", "МВатт*ч/год")
+    electricity_variant_2 = _scalar("Электроэнергия (вариант 2)", "МВатт*ч/год")
+    diesel_selected = _scalar("Дизельное топливо (выбранный вариант)", "т/год")
+    diesel_variant_1 = _scalar("Дизельное топливо (вариант 1)", "т/год")
+    diesel_variant_2 = _scalar("Дизельное топливо (вариант 2)", "т/год")
+
+    purchase_power_cost = electricity_price * electricity_variant_1
+    selfgen_power_cost = electricity_price * electricity_variant_2
+    purchase_diesel_cost = diesel_price * diesel_variant_1
+    selfgen_diesel_cost = diesel_price * diesel_variant_2
+
+    purchase_power_series = pd.Series(
+        purchase_power_cost, index=period_index, name="power_purchase"
+    )
+    selfgen_power_series = pd.Series(
+        selfgen_power_cost, index=period_index, name="power_purchase"
+    )
+    purchase_diesel_series = pd.Series(
+        purchase_diesel_cost, index=period_index, name="fuel"
+    )
+    selfgen_diesel_series = pd.Series(
+        selfgen_diesel_cost, index=period_index, name="fuel"
+    )
+
+    base_mode = _normalize_power_mode(scenario)
+    if not scenario:
+        # Fall back on selected consumption mix if the scenario cell is empty.
+        base_mode = "selfgen" if electricity_selected == 0.0 else "purchase"
+
+    electricity_variants = {
+        "selected": electricity_selected,
+        "purchase": electricity_variant_1,
+        "selfgen": electricity_variant_2,
+    }
+    diesel_variants = {
+        "selected": diesel_selected,
+        "purchase": diesel_variant_1,
+        "selfgen": diesel_variant_2,
+    }
+
+    purchase_power_capex, selfgen_power_capex = _load_power_capex_series(
+        capex_sheet, period_index, value_columns
+    )
+
+    return PowerInputs(
+        scenario_label=scenario,
+        base_mode=base_mode,
+        electricity_price_thousand_rub_per_mwh=electricity_price,
+        diesel_price_thousand_rub_per_ton=diesel_price,
+        electricity_variants=electricity_variants,
+        diesel_variants=diesel_variants,
+        purchase_power_opex=purchase_power_series,
+        selfgen_power_opex=selfgen_power_series,
+        purchase_diesel_opex=purchase_diesel_series,
+        selfgen_diesel_opex=selfgen_diesel_series,
+        capex_purchase_power=purchase_power_capex,
+        capex_selfgen_power=selfgen_power_capex,
+    )
+
+
+def _load_power_capex_series(
+    capex_sheet: pd.DataFrame,
+    period_index: pd.Index,
+    value_columns: Iterable[str],
+) -> tuple[pd.Series, pd.Series]:
+    """
+    Fetch CAPEX series specific to the power-supply choice.
+
+    FEM.xlsx (CAPEX sheet) currently does not expose distinct rows for purchased
+    vs. self-generated power infrastructure, so placeholder zero series are used
+    until those ranges are mapped. TODO(aragamin): hook up the actual rows once
+    the workbook exposes them (likely within the CAPEX sheet's investment
+    program block).
+    """
+
+    label_col = _normalized_column(capex_sheet, "Unnamed: 3")
+
+    def series_for(labels: Iterable[str], placeholder_name: str) -> pd.Series:
+        for label in labels:
+            try:
+                return _extract_series(
+                    capex_sheet, label_col, value_columns, period_index, label
+                )
+            except KeyError:
+                continue
+        placeholder = pd.Series(0.0, index=period_index, name=placeholder_name)
+        placeholder.attrs[
+            "note"
+        ] = f"TODO: map '{placeholder_name}' from CAPEX sheet (no dedicated row in FEM.xlsx)."
+        return placeholder
+
+    purchase_labels = (
+        "Подключение к энергосистеме (CAPEX)",
+        "Инфраструктура для покупной электроэнергии",
+    )
+    selfgen_labels = (
+        "Капитальные вложения в собственную электростанцию",
+        "CAPEX собственной электростанции",
+    )
+
+    purchase = series_for(purchase_labels, "power_capex_purchase")
+    selfgen = series_for(selfgen_labels, "power_capex_selfgen")
+    purchase = purchase.reindex(period_index).fillna(0.0)
+    selfgen = selfgen.reindex(period_index).fillna(0.0)
+    return purchase, selfgen
 
 
 def _load_cashflow_data(
@@ -501,6 +744,92 @@ def _load_tax_data(
         "profit_loss_period": profit_loss_period,
         "profit_loss_cumulative": profit_loss_cumulative,
     }
+
+
+def _load_financing_inputs(
+    financing_sheet: pd.DataFrame,
+    period_index: pd.Index,
+    value_columns: Iterable[str],
+) -> FinancingInputs:
+    label_col = _normalized_column(financing_sheet, "Unnamed: 3")
+    section_col_raw = financing_sheet["Параметры модели"].astype(str).str.strip()
+    section_col = section_col_raw.replace({"nan": ""}).replace("", pd.NA).ffill().fillna("")
+
+    def _series(label: str, section_keyword: Optional[str] = None) -> pd.Series:
+        mask = label_col.eq(label)
+        if section_keyword:
+            mask &= section_col.str.contains(section_keyword, case=False, na=False)
+        if not mask.any():
+            return pd.Series(0.0, index=period_index, name=label)
+        row = financing_sheet.loc[mask, list(value_columns)]
+        if row.empty:
+            return pd.Series(0.0, index=period_index, name=label)
+        values = pd.to_numeric(row.iloc[0], errors="coerce").fillna(0.0).astype(float)
+        return pd.Series(values.values, index=period_index, name=label)
+
+    interest_rate_series = _series("Стоимость привлечения финансирования")
+    equity_ratio_series = _series("Доля собственных средств в финансировании")
+    equity_ratio = float(equity_ratio_series.iloc[0])
+    interest_rate = float(interest_rate_series.iloc[0])
+    debt_ratio = max(0.0, 1.0 - equity_ratio)
+
+    debt_draw = _series("Постуление финансирования", section_keyword="кредит")
+    debt_balance = _series("Остаток кредитов на конец периода")
+    debt_repayment = _series("Возврат кредитов")
+    interest_expense = _series("Проценты к уплате")
+    equity_injection = _series("Постуление финансирования", section_keyword="собствен")
+
+    debt_draw = debt_draw.clip(lower=0.0)
+    debt_balance = debt_balance.clip(lower=0.0)
+    debt_repayment = debt_repayment.clip(lower=0.0)
+    interest_expense = interest_expense.abs()
+    equity_injection = equity_injection.clip(lower=0.0)
+
+    active_balance = debt_balance[debt_balance > 1e-6]
+    tenor_periods = 0
+
+    active_draw = debt_draw[debt_draw > 1e-6]
+    if not active_draw.empty:
+        first_draw_period = int(active_draw.index[0])
+        repayments_after_draw = debt_repayment[
+            debt_repayment.index >= first_draw_period
+        ]
+        active_repayments = repayments_after_draw[repayments_after_draw > 1e-6]
+        if not active_repayments.empty:
+            first_repayment_period = int(active_repayments.index[0])
+            last_repayment_period = int(active_repayments.index[-1])
+            grace_periods = max(0, first_repayment_period - first_draw_period)
+            tenor_periods = max(tenor_periods, last_repayment_period - first_draw_period + 1)
+        else:
+            grace_periods = 0
+    else:
+        grace_periods = 0
+
+    if tenor_periods == 0 and not active_balance.empty:
+        first_period = int(active_balance.index[0])
+        last_period = int(active_balance.index[-1])
+        tenor_periods = max(1, last_period - first_period + 1)
+
+    total_debt = float(debt_draw.sum())
+    if total_debt == 0.0:
+        tenor_periods = 0
+        grace_periods = 0
+    else:
+        tenor_periods = max(tenor_periods, grace_periods + 1)
+
+    return FinancingInputs(
+        interest_rate=interest_rate,
+        equity_ratio=equity_ratio,
+        debt_ratio=debt_ratio,
+        tenor_periods=tenor_periods,
+        grace_periods=grace_periods,
+        debt_amount=total_debt if total_debt > 0.0 else None,
+        excel_debt_draw=debt_draw,
+        excel_debt_repayment=debt_repayment,
+        excel_debt_balance=debt_balance,
+        excel_interest_expense=interest_expense,
+        excel_equity_injection=equity_injection,
+    )
 
 
 def _build_working_capital_inputs(
