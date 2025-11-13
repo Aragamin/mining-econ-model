@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import List, Optional
+
+from model_inputs import ModelInputs
 
 
 def _parse_float_tokens(raw: str, context: str) -> List[float]:
@@ -52,3 +55,42 @@ def parse_required_str_list(raw: str, label: str) -> List[str]:
     if not values:
         raise ValueError(f"{label} must contain at least one value.")
     return values
+
+
+def configure_model_inputs(
+    inputs: ModelInputs,
+    *,
+    financing_mode: Optional[str] = None,
+    interest_tax_deductible: Optional[bool] = None,
+) -> ModelInputs:
+    """
+    Return a copy of ModelInputs with financing/tax configuration overrides.
+
+    The helper avoids in-place mutation of the shared ModelInputs object by
+    creating shallow copies of the nested dataclasses when changes are needed.
+    """
+
+    updated_financing = inputs.financing
+    if financing_mode and inputs.financing is not None:
+        current_mode = getattr(inputs.financing, "financing_mode", "synthetic")
+        if financing_mode != current_mode:
+            updated_financing = replace(inputs.financing, financing_mode=financing_mode)
+
+    updated_tax_params = inputs.tax_parameters
+    if interest_tax_deductible is not None and interest_tax_deductible != inputs.tax_parameters.interest_tax_deductible:
+        updated_tax_params = replace(inputs.tax_parameters, interest_tax_deductible=interest_tax_deductible)
+
+    if updated_tax_params.interest_tax_deductible:
+        if updated_financing is None:
+            raise ValueError("Interest tax shield requires financing inputs to be available.")
+        mode = getattr(updated_financing, "financing_mode", "excel")
+        if mode != "excel":
+            raise ValueError("Interest tax shield requires financing_mode='excel'.")
+
+    if updated_financing is inputs.financing and updated_tax_params is inputs.tax_parameters:
+        return inputs
+
+    return inputs.copy_with(
+        financing=updated_financing,
+        tax_parameters=updated_tax_params,
+    )

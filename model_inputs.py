@@ -153,6 +153,7 @@ class ModelInputs:
     prices: pd.DataFrame
     opex: pd.DataFrame
     opex_breakdown: pd.DataFrame
+    other_production_taxes: pd.Series
     capex: pd.Series
     working_capital: pd.Series
     working_capital_inputs: WorkingCapitalInputs
@@ -184,6 +185,7 @@ class ModelInputs:
             "prices": self.prices.copy(),
             "opex": self.opex.copy(),
             "opex_breakdown": self.opex_breakdown.copy(),
+            "other_production_taxes": self.other_production_taxes.copy(),
             "capex": self.capex.copy(),
             "working_capital": self.working_capital.copy(),
             "working_capital_inputs": self.working_capital_inputs,
@@ -262,9 +264,17 @@ def load_model_inputs(excel_path: Optional[Path] = None) -> ModelInputs:
     tax_parameters = _load_tax_parameters(
         inputs_sheet, period_index, value_columns
     )
+    other_production_taxes = _derive_other_production_taxes(
+        cashflow_data["opex"]["production_taxes"],
+        tax_data["excel_taxes"],
+    )
+    core_opex_excel = (
+        cashflow_data["opex"]["operating_costs"].reindex(period_index).fillna(0.0)
+        + other_production_taxes
+    )
     profit_tax_adjustment = _calculate_profit_tax_adjustment(
         cashflow_data["revenue"],
-        cashflow_data["opex_total"],
+        core_opex_excel,
         tax_data["depreciation"],
         excel_profit_loss_period,
     )
@@ -306,6 +316,7 @@ def load_model_inputs(excel_path: Optional[Path] = None) -> ModelInputs:
         prices=prices,
         opex=cashflow_data["opex"],
         opex_breakdown=opex_breakdown,
+        other_production_taxes=other_production_taxes,
         capex=cashflow_data["capex"],
         working_capital=working_capital_change,
         working_capital_inputs=working_capital_inputs,
@@ -827,26 +838,48 @@ def _load_tax_parameters(
 
 def _calculate_profit_tax_adjustment(
     revenue: pd.Series,
-    opex_total: pd.Series,
+    core_opex: pd.Series,
     depreciation: pd.Series,
     excel_profit_loss_period: pd.Series,
 ) -> pd.Series:
     """
-    Derive any residual adjustments between modeled EBIT and Excel profit rows.
+    Derive the residual adjustment between modeled EBIT and Excel profit rows.
 
-    Excel's tax sheet embeds start-up adjustments that are not part of the
-    structured OPEX inputs. Capturing the delta here allows the Python model to
-    reproduce the Excel taxable base while still exposing the adjustments as a
-    dedicated series for future scenario control.
+    Excel's tax sheet embeds start-up adjustments and manual clean-ups that are
+    not part of the structured OPEX/tax inputs. Capturing the period-by-period
+    delta keeps the Python taxable base aligned for validation purposes while
+    also exposing the magnitude of the bridge as a dedicated diagnostic series.
     """
 
     revenue = revenue.reindex(excel_profit_loss_period.index).fillna(0.0)
-    opex_total = opex_total.reindex(excel_profit_loss_period.index).fillna(0.0)
+    core_opex = core_opex.reindex(excel_profit_loss_period.index).fillna(0.0)
     depreciation = depreciation.reindex(excel_profit_loss_period.index).fillna(0.0)
-    modeled_profit = revenue - opex_total - depreciation
+    modeled_profit = revenue - core_opex - depreciation
     adjustment = excel_profit_loss_period.reindex(modeled_profit.index).fillna(0.0) - modeled_profit
     adjustment.name = "profit_taxable_adjustment"
     return adjustment
+
+
+def _derive_other_production_taxes(
+    production_taxes: pd.Series,
+    excel_taxes: pd.DataFrame,
+) -> pd.Series:
+    """
+    Separate NDPI/property components from the Excel production-tax series.
+
+    The FEM cash-flow sheet groups NDPI, property tax, and other levies together
+    under "Налоги и отчисления в себестоимости". To make NDPI/property fully
+    model-driven, this helper strips the Excel NDPI/property reference series,
+    leaving behind the residual production taxes that should remain fixed unless
+    explicitly scenarioed.
+    """
+
+    ndpi = excel_taxes["mineral_extraction_tax"].reindex(production_taxes.index).fillna(0.0)
+    property_tax = excel_taxes["property_tax"].reindex(production_taxes.index).fillna(0.0)
+    residual = production_taxes.reindex(ndpi.index).fillna(0.0) - ndpi - property_tax
+    residual = residual.clip(lower=0.0)
+    residual.name = "other_production_taxes"
+    return residual
 
 
 def _normalize_rate_series(series: pd.Series) -> pd.Series:

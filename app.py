@@ -2,11 +2,17 @@ from __future__ import annotations
 
 import pandas as pd
 import streamlit as st
+import altair as alt
 
-from interface_utils import parse_required_float_list, parse_required_str_list
+from interface_utils import (
+    configure_model_inputs,
+    parse_required_float_list,
+    parse_required_str_list,
+)
 from model_inputs import ModelInputs, load_model_inputs
 from project_model import MineProjectModel
 from sensitivity import run_scenarios
+from validation import summarize_validation
 
 
 @st.cache_resource(show_spinner=False)
@@ -113,6 +119,17 @@ def main() -> None:
             value=True,
             help="Show levered KPIs derived from the financing schedule.",
         )
+        financing_mode = st.selectbox(
+            "Financing mode",
+            ["excel", "synthetic"],
+            index=0 if (base_inputs.financing and base_inputs.financing.financing_mode == "excel") else 1,
+            help="Use FEM debt schedule or synthetic schedule for new scenarios.",
+        )
+        interest_shield = st.checkbox(
+            "Interest tax shield",
+            value=bool(base_inputs.tax_parameters.interest_tax_deductible),
+            help="Deduct interest expense from the profit-tax base (Excel financing recommended).",
+        )
         price_multiplier = st.slider(
             "Price multiplier",
             min_value=0.5,
@@ -144,24 +161,75 @@ def main() -> None:
         power_mode=power_mode,
     )
 
-    model = MineProjectModel(adjusted_inputs, taxes_mode=tax_mode)
+    try:
+        configured_inputs = configure_model_inputs(
+            adjusted_inputs,
+            financing_mode=financing_mode,
+            interest_tax_deductible=interest_shield,
+        )
+    except ValueError as exc:
+        st.error(str(exc))
+        st.stop()
 
-    st.subheader("Base-case KPIs")
-    info_cols = st.columns(3)
-    info_cols[0].metric("Tax mode", tax_mode)
-    info_cols[1].metric("Power mode", power_mode)
-    info_cols[2].metric("Financing enabled", "Yes" if use_financing else "No")
+    model = MineProjectModel(configured_inputs, taxes_mode=tax_mode)
+    tax_detail = model.calc_taxes_detailed()
+    unlevered_cf = model.calc_unlevered_cashflow()
+    levered_cf = model.calc_levered_cashflow() if use_financing else None
+    revenue_series = model.calc_revenue()
+    operating_costs = model.calc_costs()
 
-    kpi_table = _format_kpis(model, discount_rate, include_levered=use_financing)
-    st.table(kpi_table)
+    scenario_df: pd.DataFrame | None = None
+    scenario_tabs = st.tabs(["KPIs", "Scenarios", "Validation"])
 
-    st.markdown("---")
-    st.subheader("Scenario grid")
+    with scenario_tabs[0]:
+        st.subheader("Base-case KPIs")
+        info_cols = st.columns(4)
+        info_cols[0].metric("Tax mode", tax_mode)
+        info_cols[1].metric("Power mode", power_mode)
+        info_cols[2].metric("Financing mode", financing_mode)
+        info_cols[3].metric("Interest shield", "On" if interest_shield else "Off")
 
-    scenario_cols = st.columns(3)
-    price_mult_input = scenario_cols[0].text_input(
-        "Price multipliers",
-        value="0.9, 1.0, 1.1",
+        kpi_table = _format_kpis(model, discount_rate, include_levered=use_financing)
+        st.table(kpi_table)
+
+        st.markdown("### Cash flow profile")
+        cashflow_df = pd.DataFrame({"period": unlevered_cf.index, "Unlevered CF": unlevered_cf.values})
+        if levered_cf is not None:
+            cashflow_df["Levered CF"] = levered_cf.values
+        cashflow_long = cashflow_df.melt(id_vars="period", var_name="series", value_name="thousand_rub")
+        cf_chart = (
+            alt.Chart(cashflow_long)
+            .mark_line(point=True)
+            .encode(x="period:Q", y="thousand_rub:Q", color="series:N")
+            .properties(height=300)
+        )
+        st.altair_chart(cf_chart, use_container_width=True)
+
+        st.markdown("### Revenue vs costs and taxes")
+        revenue_cost_df = pd.DataFrame(
+            {
+                "period": revenue_series.index,
+                "Revenue": revenue_series.values,
+                "Operating costs": operating_costs.values,
+                "Total tax": tax_detail["total_tax"].values,
+            }
+        )
+        revenue_cost_long = revenue_cost_df.melt(id_vars="period", var_name="category", value_name="thousand_rub")
+        rev_chart = (
+            alt.Chart(revenue_cost_long)
+            .mark_line()
+            .encode(x="period:Q", y="thousand_rub:Q", color="category:N")
+            .properties(height=300)
+        )
+        st.altair_chart(rev_chart, use_container_width=True)
+
+    with scenario_tabs[1]:
+        st.subheader("Scenario grid")
+
+        scenario_cols = st.columns(3)
+        price_mult_input = scenario_cols[0].text_input(
+            "Price multipliers",
+            value="0.9, 1.0, 1.1",
         help="Comma-separated list (e.g., 0.9,1.0,1.1).",
     )
     opex_mult_input = scenario_cols[1].text_input(
@@ -197,79 +265,100 @@ def main() -> None:
         except ValueError as exc:
             scenario_error = str(exc)
 
-    if scenario_error:
-        st.error(scenario_error)
-    else:
-        scenario_df = run_scenarios(
-            base_inputs=adjusted_inputs,
-            price_multipliers=price_multipliers or [1.0],
-            opex_multipliers=opex_multipliers,
-            power_modes=power_modes_list,
-            use_levered=use_financing,
-            discount_rate_override=discount_rate,
+        if scenario_error:
+            st.error(scenario_error)
+        else:
+            try:
+                scenario_df = run_scenarios(
+                    base_inputs=configured_inputs,
+                    price_multipliers=price_multipliers or [1.0],
+                    opex_multipliers=opex_multipliers,
+                    power_modes=power_modes_list,
+                    use_levered=use_financing,
+                    discount_rate_override=discount_rate,
+                    tax_mode=tax_mode,
+                    financing_mode=financing_mode,
+                    interest_tax_deductible=interest_shield,
+                )
+            except ValueError as exc:
+                st.error(str(exc))
+            else:
+                payback_cols = ["unlev_pb", "unlev_dpb", "lev_pb", "lev_dpb"]
+                for column in payback_cols:
+                    if column in scenario_df.columns:
+                        scenario_df[column] = pd.to_numeric(scenario_df[column], errors="coerce")
+                st.dataframe(scenario_df, width="stretch")
+
+                st.markdown("### NPV vs price multiplier")
+                npv_line_df = (
+                    scenario_df.groupby("price_mult", as_index=False)["unlev_npv"]
+                    .mean()
+                    .rename(columns={"unlev_npv": "NPV"})
+                )
+                line_chart = (
+                    alt.Chart(npv_line_df)
+                    .mark_line(point=True)
+                    .encode(x="price_mult:Q", y="NPV:Q")
+                )
+                st.altair_chart(line_chart, use_container_width=True)
+
+                st.markdown("### Price vs OPEX multiplier (NPV heatmap)")
+                scatter = (
+                    alt.Chart(scenario_df)
+                    .mark_circle(size=120)
+                    .encode(
+                        x="price_mult:Q",
+                        y="opex_mult:Q",
+                        color="unlev_npv:Q",
+                        tooltip=["price_mult", "opex_mult", "unlev_npv"],
+                    )
+                    .properties(height=300)
+                )
+                st.altair_chart(scatter, use_container_width=True)
+
+    with scenario_tabs[2]:
+        st.subheader("Validation & Excel reconciliation")
+        st.write(
+            "Run the validation report to compare Python outputs against FEM.xlsx for the current configuration."
         )
-        payback_cols = ["unlev_pb", "unlev_dpb", "lev_pb", "lev_dpb"]
-        for column in payback_cols:
-            if column in scenario_df.columns:
-                scenario_df[column] = pd.to_numeric(scenario_df[column], errors="coerce")
-        st.dataframe(scenario_df, width="stretch")
+        if "validation_cache" not in st.session_state:
+            st.session_state.validation_cache = None
 
-    st.markdown("---")
-    with st.expander("Reconciliation vs FEM.xlsx", expanded=False):
-        recon = model.check_against_excel()
-        core_recon = recon[recon["metric"] != "financing"]
-        fin_recon = recon[recon["metric"] == "financing"]
+        if st.button("Run validation report", type="primary"):
+            summary_df, recon_df = summarize_validation(model)
+            st.session_state.validation_cache = (summary_df, recon_df)
 
-        def fmt_row(row: pd.Series, include_pct: bool = True) -> dict[str, float | str | None]:
-            return {
-                "metric": row["metric"],
-                "subcategory": row["subcategory"],
-                "period": int(row["period"]),
-                "excel_value": row["excel_value"],
-                "python_value": row["python_value"],
-                "diff_abs": row["diff_abs"],
-                "diff_pct": row["diff_pct"] if include_pct else None,
-            }
-
-        summary_core: list[dict[str, float | str | None]] = []
-        if not core_recon.empty:
-            summary_core.append(
-                {"type": "Largest abs deviation", **fmt_row(core_recon.loc[core_recon["diff_abs"].abs().idxmax()], include_pct=False)}
-            )
-            pct_series = core_recon["diff_pct"].abs().dropna()
-            if not pct_series.empty:
-                summary_core.append(
-                    {"type": "Largest \%\ deviation", **fmt_row(core_recon.loc[pct_series.idxmax()])}
-                )
-            tax_rows = core_recon[core_recon["metric"] == "tax"]
-            if not tax_rows.empty:
-                summary_core.append(
-                    {"type": "Largest tax deviation", **fmt_row(tax_rows.loc[tax_rows["diff_abs"].idxmax()])}
-                )
-
-        summary_fin: list[dict[str, float | str | None]] = []
-        if not fin_recon.empty:
-            summary_fin.append(
+        cache = st.session_state.validation_cache
+        if cache is None:
+            st.info("Press the button above to generate the validation report.")
+        else:
+            summary_df, recon_df = cache
+            st.markdown("#### Summary deviations")
+            summary_sorted = summary_df.sort_values("max_abs_diff", ascending=False)
+            styled_summary = summary_sorted.style.format(
                 {
-                    "type": "Largest financing deviation",
-                    **fmt_row(fin_recon.loc[fin_recon["diff_abs"].abs().idxmax()], include_pct=False),
+                    "max_abs_diff": "{:,.2f}",
+                    "excel_at_max_abs": "{:,.2f}",
+                    "python_at_max_abs": "{:,.2f}",
+                    "max_pct_diff": lambda v: f"{v*100:,.2f}%" if pd.notna(v) else "n/a",
                 }
             )
+            st.dataframe(styled_summary, use_container_width=True)
 
-        st.caption("Core deviations (excluding financing)")
-        if summary_core:
-            st.table(pd.DataFrame(summary_core))
-        else:
-            st.write("No core deviations available.")
+            st.markdown("#### Detailed reconciliation")
+            metric_options = ["All"] + sorted(recon_df["metric"].unique())
+            metric_choice = st.selectbox("Metric filter", metric_options)
+            filtered_recon = recon_df.copy()
+            if metric_choice != "All":
+                filtered_recon = filtered_recon[filtered_recon["metric"] == metric_choice]
+            filtered_recon = filtered_recon.sort_values("diff_abs", ascending=False)
+            st.dataframe(filtered_recon, use_container_width=True)
 
-        st.caption("Financing deviations (expected to differ from FEM.xlsx)")
-        if summary_fin:
-            st.table(pd.DataFrame(summary_fin))
-        else:
-            st.write("No financing deviations available.")
-
-        if st.checkbox("Show full reconciliation table"):
-            st.dataframe(recon, width="stretch")
+            residual_cols = [col for col in tax_detail.columns if col.endswith("_residual_vs_excel")]
+            if residual_cols:
+                st.markdown("#### Tax residual diagnostics (Python − Excel)")
+                residual_df = tax_detail[residual_cols]
+                st.dataframe(residual_df, use_container_width=True)
 
 
 if __name__ == "__main__":

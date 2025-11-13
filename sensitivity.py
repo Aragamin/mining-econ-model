@@ -5,6 +5,7 @@ from typing import Iterable, List, Optional, Sequence
 import pandas as pd
 import numpy as np
 
+from interface_utils import configure_model_inputs
 from model_inputs import ModelInputs
 from project_model import MineProjectModel
 
@@ -43,6 +44,9 @@ def run_scenarios(
     power_modes: Optional[Sequence[str]] = None,
     use_levered: bool = False,
     discount_rate_override: Optional[float] = None,
+    tax_mode: Optional[str] = None,
+    financing_mode: Optional[str] = None,
+    interest_tax_deductible: Optional[bool] = None,
 ) -> pd.DataFrame:
     """Evaluate KPI grid across price/OPEX/power-mode combinations.
 
@@ -58,6 +62,11 @@ def run_scenarios(
             `calc_levered_cashflow()`.
         discount_rate_override: Optional discount rate applied to both levered
             and unlevered KPIs; falls back to each scenario's `ModelInputs` rate.
+        tax_mode: Optional profit-tax regime passed to MineProjectModel.
+        financing_mode: Optional financing mode override propagated through
+            `configure_model_inputs`.
+        interest_tax_deductible: When provided, overrides the tax configuration
+            flag controlling the interest tax shield.
 
     Returns:
         pandas.DataFrame containing scenario descriptors and KPI columns. NPV
@@ -107,7 +116,12 @@ def run_scenarios(
                     power_mode=powered_mode,
                 )
 
-                model = MineProjectModel(updated_inputs)
+                configured_inputs = configure_model_inputs(
+                    updated_inputs,
+                    financing_mode=financing_mode,
+                    interest_tax_deductible=interest_tax_deductible,
+                )
+                model = MineProjectModel(configured_inputs, taxes_mode=tax_mode)
                 discount_rate = (
                     discount_rate_override
                     if discount_rate_override is not None

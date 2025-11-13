@@ -1,31 +1,48 @@
 from __future__ import annotations
 
 import argparse
+from typing import Optional
 
 import pandas as pd
 
-from interface_utils import parse_optional_float_list, parse_optional_str_list
+from interface_utils import (
+    configure_model_inputs,
+    parse_optional_float_list,
+    parse_optional_str_list,
+)
 from model_inputs import ModelInputs, load_model_inputs
 from project_model import MineProjectModel
 from sensitivity import run_scenarios
+from validation import summarize_validation
 
 
-def _run_base_case(inputs: ModelInputs) -> None:
+def _run_base_case(
+    inputs: ModelInputs,
+    tax_mode: Optional[str],
+    financing_mode: Optional[str],
+    interest_tax_shield: bool,
+    show_validation: bool,
+) -> None:
     """Execute the base-case report with unlevered/levered KPIs and checks."""
-    model = MineProjectModel(inputs)
+    configured_inputs = configure_model_inputs(
+        inputs,
+        financing_mode=financing_mode,
+        interest_tax_deductible=interest_tax_shield,
+    )
+    model = MineProjectModel(configured_inputs, taxes_mode=tax_mode)
 
     unlevered_cf = model.calc_unlevered_cashflow()
     npv = model.calc_npv()
     irr = model.calc_irr()
     payback = model.calc_payback()
     discounted_payback = model.calc_discounted_payback()
-    levered_npv = model.calc_levered_npv(inputs.discount_rate)
+    levered_npv = model.calc_levered_npv(configured_inputs.discount_rate)
     levered_irr = model.calc_levered_irr()
 
     print("Mine project metrics (base case):")
-    print(f"  Scenario: {inputs.scenario}")
-    print(f"  Discount rate: {inputs.discount_rate:.2%}")
-    print(f"  Profit tax rate: {inputs.profit_tax_rate:.2%}")
+    print(f"  Scenario: {configured_inputs.scenario}")
+    print(f"  Discount rate: {configured_inputs.discount_rate:.2%}")
+    print(f"  Profit tax rate: {configured_inputs.profit_tax_rate:.2%}")
     print()
     print("  NPV: {:,.0f} thousand RUB".format(npv))
     print("  IRR: {:.2%}".format(irr))
@@ -39,7 +56,7 @@ def _run_base_case(inputs: ModelInputs) -> None:
     print()
 
     reconciliation = model.check_against_excel()
-    core_recon = reconciliation[reconciliation["metric"] != "financing"]
+    core_recon = reconciliation[~reconciliation["metric"].isin(["financing", "levered_cashflow"])]
     fin_recon = reconciliation[reconciliation["metric"] == "financing"]
 
     def _format_row(row: pd.Series, include_pct: bool = True) -> dict[str, float | str | None]:
@@ -60,7 +77,7 @@ def _run_base_case(inputs: ModelInputs) -> None:
     core_abs = core_pct = None
     if not core_recon.empty:
         core_abs = _format_row(core_recon.loc[core_recon["diff_abs"].abs().idxmax()], include_pct=False)
-        pct_series = core_recon["diff_pct"].abs().dropna()
+        pct_series = core_recon.loc[core_recon["excel_value"].abs() > 1e-6, "diff_pct"].abs().dropna()
         if not pct_series.empty:
             core_pct = _format_row(core_recon.loc[pct_series.idxmax()])
 
@@ -134,6 +151,46 @@ def _run_base_case(inputs: ModelInputs) -> None:
     else:
         print("  Largest financing deviation: n/a (no financing rows)")
 
+    if show_validation:
+        _print_validation_report(model)
+
+
+def _print_validation_report(model: MineProjectModel) -> None:
+    """Emit a concise validation summary for key metrics."""
+
+    summary, recon = summarize_validation(model)
+    if summary.empty:
+        print("Validation report: no comparable metrics were produced.")
+        return
+
+    print("\nValidation report (Python vs FEM.xlsx):")
+    for _, row in summary.sort_values("label").iterrows():
+        label = row["label"]
+        abs_diff = row["max_abs_diff"]
+        abs_period = row["max_abs_period"]
+        excel_value = row["excel_at_max_abs"]
+        python_value = row["python_at_max_abs"]
+        pct_diff = row["max_pct_diff"]
+        pct_period = row["max_pct_period"]
+        print(
+            f"  {label:<15} | max abs diff {abs_diff:,.2f} (period {abs_period}) "
+            f"Excel={excel_value:,.2f}, Python={python_value:,.2f}"
+        )
+        if pct_diff is not None:
+            print(
+                f"    └─ max pct diff {pct_diff*100:,.2f}% (period {pct_period})"
+            )
+
+    tax_rows = recon[(recon["metric"] == "tax") & (recon["subcategory"] == "profit_tax")]
+    if not tax_rows.empty:
+        idx = tax_rows["diff_abs"].abs().idxmax()
+        row = tax_rows.loc[idx]
+        print(
+            "\n  Profit-tax detail (worst period): "
+            f"period {int(row['period'])}, Excel={row['excel_value']:,.2f}, "
+            f"Python={row['python_value']:,.2f}, diff={row['diff_abs']:,.2f}"
+        )
+
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Mine project model runner.")
@@ -165,13 +222,47 @@ def main() -> None:
         default=None,
         help="Override discount rate for scenario KPIs (decimal, e.g. 0.15).",
     )
+    parser.add_argument(
+        "--tax-mode",
+        choices=["basic", "standard_loss_pool", "excel_cumulative"],
+        default=None,
+        help="Select profit-tax regime for MineProjectModel.",
+    )
+    parser.add_argument(
+        "--financing-mode",
+        choices=["excel", "synthetic"],
+        default=None,
+        help="Choose debt-schedule construction (defaults to FEM value).",
+    )
+    parser.add_argument(
+        "--interest-tax-shield",
+        action="store_true",
+        help="Deduct interest expense from the profit-tax base (Excel financing only).",
+    )
+    parser.add_argument(
+        "--validation-report",
+        action="store_true",
+        help="Print detailed FEM-vs-Python validation summary (base case only).",
+    )
 
     args = parser.parse_args()
 
     inputs = load_model_inputs()
 
+    if args.validation_report and args.scenario_grid:
+        parser.error("--validation-report is only available with the base-case run.")
+
     if not args.scenario_grid:
-        _run_base_case(inputs)
+        try:
+            _run_base_case(
+                inputs,
+                tax_mode=args.tax_mode,
+                financing_mode=args.financing_mode,
+                interest_tax_shield=args.interest_tax_shield,
+                show_validation=args.validation_report,
+            )
+        except ValueError as exc:
+            parser.error(str(exc))
         return
 
     try:
@@ -181,14 +272,20 @@ def main() -> None:
         parser.error(str(exc))
     power_modes = parse_optional_str_list(args.power_modes)
 
-    scenario_df = run_scenarios(
-        base_inputs=inputs,
-        price_multipliers=price_mults,
-        opex_multipliers=opex_mults,
-        power_modes=power_modes,
-        use_levered=args.levered,
-        discount_rate_override=args.discount_rate,
-    )
+    try:
+        scenario_df = run_scenarios(
+            base_inputs=inputs,
+            price_multipliers=price_mults,
+            opex_multipliers=opex_mults,
+            power_modes=power_modes,
+            use_levered=args.levered,
+            discount_rate_override=args.discount_rate,
+            tax_mode=args.tax_mode,
+            financing_mode=args.financing_mode,
+            interest_tax_deductible=args.interest_tax_shield,
+        )
+    except ValueError as exc:
+        parser.error(str(exc))
     if scenario_df.empty:
         print("No scenarios were generated.")
         return

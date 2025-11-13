@@ -33,8 +33,6 @@ class MineProjectModel:
         self.period_index = inputs.timeline.index
         self._revenue_detail: Optional[pd.DataFrame] = None
         self._working_capital_detail: Optional[pd.DataFrame] = None
-        self._ndpi_detail: Optional[pd.DataFrame] = None
-        self._property_tax_detail: Optional[pd.DataFrame] = None
         self._tax_detail: Dict[str, pd.DataFrame] = {}
         self._financing_schedule: Optional[pd.DataFrame] = None
         self.base_opex_breakdown = inputs.opex_breakdown.copy()
@@ -136,74 +134,6 @@ class MineProjectModel:
         self._revenue_detail = detail_df
         return detail_df.copy()
 
-    def _calc_ndpi_detail(self) -> pd.DataFrame:
-        """Return NDPI per metal based on revenue detail and statutory rates."""
-
-        if self._ndpi_detail is not None:
-            return self._ndpi_detail.copy()
-
-        detail = self.calc_revenue_detail()
-        params = self.inputs.tax_parameters
-        periods = self.period_index
-        rate_gold = params.ndpi_rate_gold.reindex(periods).fillna(0.0)
-        rate_silver = params.ndpi_rate_silver.reindex(periods).fillna(0.0)
-
-        gold_tax = (detail["gold_revenue_rub"].reindex(periods).fillna(0.0) * rate_gold) / 1_000.0
-        silver_tax = (detail["silver_revenue_rub"].reindex(periods).fillna(0.0) * rate_silver) / 1_000.0
-
-        ndpi_detail = pd.DataFrame(
-            {
-                "ndpi_gold": gold_tax,
-                "ndpi_silver": silver_tax,
-                "ndpi_total": gold_tax + silver_tax,
-            },
-            index=periods,
-        )
-        self._ndpi_detail = ndpi_detail
-        return ndpi_detail.copy()
-
-    def _calc_property_tax_detail(self) -> pd.DataFrame:
-        """Return property-tax detail derived from CAPEX and depreciation."""
-
-        if self._property_tax_detail is not None:
-            return self._property_tax_detail.copy()
-
-        capex = self.calc_capex()
-        depreciation = self.inputs.depreciation.reindex(self.period_index).fillna(0.0)
-        rate_series = self.inputs.tax_parameters.property_tax_rate.reindex(self.period_index).fillna(0.0)
-
-        additions = capex.clip(lower=0.0)
-        disposals = (-capex).clip(lower=0.0)
-        opening_values: list[float] = []
-        closing_values: list[float] = []
-        base_values: list[float] = []
-
-        opening = 0.0
-        for period in self.period_index:
-            opening_values.append(opening)
-            add = additions.loc[period]
-            dispose = disposals.loc[period]
-            average_base = opening + 0.5 * add - 0.5 * dispose
-            base_values.append(max(average_base, 0.0))
-            closing = opening + add - dispose - depreciation.loc[period]
-            closing = max(closing, 0.0)
-            closing_values.append(closing)
-            opening = closing
-
-        property_tax_base = pd.Series(base_values, index=self.period_index)
-        property_tax = property_tax_base * rate_series
-        detail = pd.DataFrame(
-            {
-                "property_tax": property_tax,
-                "property_tax_base": property_tax_base,
-                "nbv_opening": pd.Series(opening_values, index=self.period_index),
-                "nbv_closing": pd.Series(closing_values, index=self.period_index),
-            },
-            index=self.period_index,
-        )
-        self._property_tax_detail = detail
-        return detail.copy()
-
     def calc_revenue(self) -> pd.Series:
         """
         Compute commodity revenue per period before taxes and investments.
@@ -221,19 +151,27 @@ class MineProjectModel:
         revenue.name = "revenue"
         return revenue
 
-        production = self.inputs.production
-        prices = self.inputs.prices
+    def _operating_costs_core(self) -> pd.Series:
+        """Return operating costs excluding NDPI/property taxes (thousand RUB)."""
 
-        ore_tonnes = production["ore_mined_kton"] * 1_000.0
-        gold_production = ore_tonnes * production["gold_grade_gpt"] * production["gold_recovery"] / 1_000.0
-        silver_production = ore_tonnes * production["silver_grade_gpt"] * production["silver_recovery"] / 1_000.0
+        base_costs = (
+            self.opex_breakdown.sum(axis=1)
+            .reindex(self.period_index)
+            .fillna(0.0)
+        )
+        other_production_taxes = (
+            self.inputs.other_production_taxes
+            .reindex(self.period_index)
+            .fillna(0.0)
+        )
+        core_costs = base_costs.add(other_production_taxes, fill_value=0.0)
 
-        gold_revenue = gold_production * prices["gold_price_rub_g"]
-        silver_revenue = silver_production * prices["silver_price_rub_g"]
-
-        revenue = gold_revenue.add(silver_revenue, fill_value=0.0)
-        revenue.name = "revenue"
-        return revenue
+        operating_costs_total = self.operating_costs_total
+        if not np.allclose(base_costs.values, operating_costs_total.values, atol=1e-6):
+            raise AssertionError(
+                "OPEX breakdown does not match total operating costs."
+            )
+        return core_costs
 
     def calc_costs(self) -> pd.Series:
         """
@@ -248,24 +186,14 @@ class MineProjectModel:
             pd.Series: Total operating costs (thousand RUB, positive = outflow).
         """
 
-        base_costs = (
-            self.opex_breakdown.sum(axis=1)
-            .reindex(self.period_index)
-            .fillna(0.0)
+        core_costs = self._operating_costs_core()
+        taxes_detail = self.calc_taxes_detailed()
+        costs = (
+            core_costs
+            .add(taxes_detail["mineral_extraction_tax"], fill_value=0.0)
+            .add(taxes_detail["property_tax"], fill_value=0.0)
         )
-        production_taxes = (
-            self.inputs.opex["production_taxes"]
-            .reindex(self.period_index)
-            .fillna(0.0)
-        )
-        costs = base_costs.add(production_taxes, fill_value=0.0)
         costs.name = "operating_costs"
-
-        operating_costs_total = self.operating_costs_total
-        if not np.allclose(base_costs.values, operating_costs_total.values, atol=1e-6):
-            raise AssertionError(
-                "OPEX breakdown does not match total operating costs."
-            )
         return costs
 
     def calc_capex(self) -> pd.Series:
@@ -360,7 +288,7 @@ class MineProjectModel:
         """
 
         revenue = self.calc_revenue()
-        costs = self.calc_costs()
+        costs = self._operating_costs_core()
         operating_profit = revenue - costs
         taxable_profit = operating_profit.clip(lower=0.0)
         taxes = taxable_profit * self.inputs.profit_tax_rate
@@ -384,15 +312,12 @@ class MineProjectModel:
             diagnostic EBIT/tax-base data (thousand RUB; positive = outflow).
         """
 
-        detailed_mode = (
-            "standard_loss_pool" if self.taxes_mode in {"detailed", "standard_loss_pool"} else self.taxes_mode
-        )
+        detailed_mode = self._resolve_loss_mode()
         if detailed_mode in self._tax_detail:
             return self._tax_detail[detailed_mode].copy()
 
         revenue_detail = self.calc_revenue_detail()
-        revenue = revenue_detail["total_revenue_thousand"]
-        opex_total = self.calc_costs()
+        opex_core = self._operating_costs_core()
         depreciation = self.inputs.depreciation.reindex(self.period_index).fillna(0.0)
         capex = self.calc_capex()
 
@@ -404,23 +329,44 @@ class MineProjectModel:
         )
 
         interest_expense: Optional[pd.Series] = None
-        if self.inputs.tax_parameters.interest_tax_deductible and self.inputs.financing is not None:
-            interest_expense = self.calc_financing_schedule()["interest_expense"]
+        if self.inputs.tax_parameters.interest_tax_deductible:
+            financing = self.inputs.financing
+            if financing is None:
+                interest_expense = None
+            else:
+                financing_mode = getattr(financing, "financing_mode", "excel")
+                if financing_mode != "excel":
+                    raise ValueError(
+                        "Interest tax shield is only supported when financing_mode='excel'."
+                    )
+                interest_expense = financing.excel_interest_expense.reindex(self.period_index).fillna(0.0)
 
-        ndpi_detail = self._calc_ndpi_detail()
-        property_detail = self._calc_property_tax_detail()
         tax_detail = tax_engine.calculate(
             revenue_detail=revenue_detail,
-            operating_costs=opex_total,
+            operating_costs=opex_core,
             depreciation=depreciation,
             capex=capex,
             interest_expense=interest_expense,
-            ndpi_detail=ndpi_detail,
-            property_detail=property_detail,
+        )
+        taxes_excel = self.inputs.excel_taxes.reindex(self.period_index).fillna(0.0)
+        tax_detail["ndpi_residual_vs_excel"] = (
+            tax_detail["mineral_extraction_tax"] - taxes_excel["mineral_extraction_tax"]
+        )
+        tax_detail["property_tax_residual_vs_excel"] = (
+            tax_detail["property_tax"] - taxes_excel["property_tax"]
         )
 
         self._tax_detail[detailed_mode] = tax_detail
         return tax_detail.copy()
+
+    def _resolve_loss_mode(self) -> str:
+        """Map user-facing tax mode to the loss-carry regime used by TaxEngine."""
+
+        if self.taxes_mode == "basic":
+            return self.inputs.tax_parameters.loss_carry_mode or "standard_loss_pool"
+        if self.taxes_mode in {"detailed", "standard_loss_pool"}:
+            return "standard_loss_pool"
+        return self.taxes_mode
 
     def calc_taxes(self):
         """
@@ -436,10 +382,11 @@ class MineProjectModel:
 
     def calc_unlevered_cashflow(self) -> pd.Series:
         """
-        Compute unlevered free cash flow by period in RUB.
+        Compute unlevered free cash flow (thousand RUB, positive = inflow).
 
-        Positive values represent net cash inflow after revenue, operating costs,
-        taxes, CAPEX, and working-capital movements.
+        The series includes all operating charges (including NDPI/property tax),
+        profit tax, CAPEX, and working-capital changes but excludes any financing
+        flows (debt draw/repayment/interest).
 
         Returns:
             pd.Series: Unlevered free cash flow in thousand RUB (positive =
@@ -600,11 +547,11 @@ class MineProjectModel:
 
         periods = self.period_index
         zero_series = pd.Series(0.0, index=periods)
-        unlevered_cf = self.calc_unlevered_cashflow()
-        funding_need = (-unlevered_cf).clip(lower=0.0)
         financing = self.inputs.financing
 
         if financing is None:
+            unlevered_cf = self.calc_unlevered_cashflow()
+            funding_need = (-unlevered_cf).clip(lower=0.0)
             schedule = pd.DataFrame(
                 {
                     "debt_opening": zero_series,
@@ -624,6 +571,9 @@ class MineProjectModel:
             schedule = self._build_excel_financing_schedule(financing)
             self._financing_schedule = schedule
             return schedule.copy()
+
+        unlevered_cf = self.calc_unlevered_cashflow()
+        funding_need = (-unlevered_cf).clip(lower=0.0)
 
         debt_share = float(np.clip(financing.debt_ratio, 0.0, 1.0))
         total_need = float(funding_need.sum())
@@ -766,8 +716,9 @@ class MineProjectModel:
         The series is expressed in thousand RUB with positive numbers
         representing cash inflows to equity stakeholders. Equity contributions
         remain implicit (negative levered cash flow) and are also reported in
-        the financing schedule for traceability. Interest tax shields are
-        intentionally excluded for now (TODO once tax engine is extended).
+        the financing schedule for traceability. Any optional interest tax
+        shield is handled through `calc_taxes_detailed()` rather than by
+        adjusting the financing flows directly.
 
         Returns:
             pd.Series: Levered cash flow available to equity (thousand RUB;
@@ -825,6 +776,7 @@ class MineProjectModel:
 
         records = []
         periods = self.period_index
+        taxes_excel = self.inputs.excel_taxes.reindex(periods).fillna(0.0)
 
         # Revenue comparison.
         revenue_python = self.calc_revenue()
@@ -851,6 +803,24 @@ class MineProjectModel:
                     period=period,
                     excel_value=opex_excel.loc[period],
                     python_value=opex_python.loc[period],
+                )
+            )
+
+        # Core OPEX comparison (excludes NDPI/property tax).
+        core_python = self._operating_costs_core()
+        core_excel = (
+            opex_excel
+            - taxes_excel["mineral_extraction_tax"]
+            - taxes_excel["property_tax"]
+        ).clip(lower=0.0)
+        for period in periods:
+            records.append(
+                self._reconciliation_record(
+                    metric="core_opex",
+                    subcategory=None,
+                    period=period,
+                    excel_value=core_excel.loc[period],
+                    python_value=core_python.loc[period],
                 )
             )
 
@@ -954,7 +924,6 @@ class MineProjectModel:
 
         # Tax comparison (always use detailed view).
         taxes_python = self.calc_taxes_detailed()
-        taxes_excel = self.inputs.excel_taxes.reindex(periods).fillna(0.0)
         for column in ["profit_tax", "mineral_extraction_tax", "property_tax", "total_tax"]:
             for period in periods:
                 records.append(
@@ -1077,6 +1046,25 @@ class MineProjectModel:
                     python_value=python_cf.loc[period],
                     )
                 )
+
+            if getattr(financing_inputs, "financing_mode", "excel") == "excel":
+                levered_python = self.calc_levered_cashflow()
+                excel_levered = (
+                    self.inputs.excel_unlevered_cashflow.reindex(periods).fillna(0.0)
+                    + financing_inputs.excel_debt_draw.reindex(periods).fillna(0.0)
+                    - financing_inputs.excel_debt_repayment.reindex(periods).fillna(0.0)
+                    - financing_inputs.excel_interest_expense.reindex(periods).fillna(0.0)
+                )
+                for period in periods:
+                    records.append(
+                        self._reconciliation_record(
+                            metric="levered_cashflow",
+                            subcategory=None,
+                            period=period,
+                            excel_value=excel_levered.loc[period],
+                            python_value=levered_python.loc[period],
+                        )
+                    )
 
         result = pd.DataFrame(records)
 
