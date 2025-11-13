@@ -7,21 +7,35 @@ import numpy_financial as npf
 import pandas as pd
 
 from model_inputs import ModelInputs
+from tax_engine import TaxEngine
 
 
 class MineProjectModel:
     """Core project cash-flow model for the mining project."""
 
-    def __init__(self, inputs: ModelInputs, taxes_mode: str = "detailed") -> None:
+    TAX_MODES = {"basic", "detailed", "standard_loss_pool", "excel_cumulative"}
+
+    def __init__(self, inputs: ModelInputs, taxes_mode: Optional[str] = None) -> None:
         """Initialize the model with structured inputs."""
 
-        if taxes_mode not in {"basic", "detailed"}:
-            raise ValueError("taxes_mode must be either 'basic' or 'detailed'.")
+        default_mode = inputs.tax_parameters.loss_carry_mode or "standard_loss_pool"
+        resolved_mode = taxes_mode or default_mode
+        if resolved_mode == "detailed":
+            resolved_mode = "standard_loss_pool"
+
+        if resolved_mode not in self.TAX_MODES:
+            raise ValueError(
+                "taxes_mode must be one of {'basic', 'detailed', "
+                "'standard_loss_pool', 'excel_cumulative'}."
+            )
 
         self.inputs = inputs
         self.period_index = inputs.timeline.index
+        self._revenue_detail: Optional[pd.DataFrame] = None
         self._working_capital_detail: Optional[pd.DataFrame] = None
-        self._tax_detail: Optional[pd.DataFrame] = None
+        self._ndpi_detail: Optional[pd.DataFrame] = None
+        self._property_tax_detail: Optional[pd.DataFrame] = None
+        self._tax_detail: Dict[str, pd.DataFrame] = {}
         self._financing_schedule: Optional[pd.DataFrame] = None
         self.base_opex_breakdown = inputs.opex_breakdown.copy()
         self.power_inputs = inputs.power_inputs
@@ -30,7 +44,7 @@ class MineProjectModel:
         )
         self.opex_breakdown = self._apply_power_mode_to_opex()
         self.operating_costs_total = self._build_operating_costs_total()
-        self.taxes_mode = taxes_mode
+        self.taxes_mode = resolved_mode
 
     def _apply_power_mode_to_opex(self) -> pd.DataFrame:
         """Return OPEX breakdown adjusted for the requested power scenario."""
@@ -89,15 +103,123 @@ class MineProjectModel:
         )
         return {"purchase": purchase, "selfgen": selfgen}
 
+    def calc_revenue_detail(self) -> pd.DataFrame:
+        """
+        Return per-metal production and revenue detail with explicit units.
+
+        Columns include grams produced and RUB revenue for gold/silver plus the
+        aggregated thousand-RUB revenue used elsewhere in the model.
+        """
+
+        if self._revenue_detail is not None:
+            return self._revenue_detail.copy()
+
+        production = self.inputs.production.reindex(self.period_index).fillna(0.0)
+        prices = self.inputs.prices.reindex(self.period_index).fillna(0.0)
+
+        ore_tonnes = production["ore_mined_kton"] * 1_000.0
+        detail: Dict[str, pd.Series] = {}
+
+        for metal in ("gold", "silver"):
+            grade = production[f"{metal}_grade_gpt"]
+            recovery = production[f"{metal}_recovery"]
+            grams = ore_tonnes * grade * recovery
+            price_rub = prices[f"{metal}_price_rub_g"]
+            revenue_rub = grams * price_rub
+            detail[f"{metal}_grams"] = grams
+            detail[f"{metal}_revenue_rub"] = revenue_rub
+
+        detail_df = pd.DataFrame(detail, index=self.period_index)
+        detail_df["total_revenue_rub"] = detail_df["gold_revenue_rub"] + detail_df["silver_revenue_rub"]
+        detail_df["total_revenue_thousand"] = detail_df["total_revenue_rub"] / 1_000.0
+
+        self._revenue_detail = detail_df
+        return detail_df.copy()
+
+    def _calc_ndpi_detail(self) -> pd.DataFrame:
+        """Return NDPI per metal based on revenue detail and statutory rates."""
+
+        if self._ndpi_detail is not None:
+            return self._ndpi_detail.copy()
+
+        detail = self.calc_revenue_detail()
+        params = self.inputs.tax_parameters
+        periods = self.period_index
+        rate_gold = params.ndpi_rate_gold.reindex(periods).fillna(0.0)
+        rate_silver = params.ndpi_rate_silver.reindex(periods).fillna(0.0)
+
+        gold_tax = (detail["gold_revenue_rub"].reindex(periods).fillna(0.0) * rate_gold) / 1_000.0
+        silver_tax = (detail["silver_revenue_rub"].reindex(periods).fillna(0.0) * rate_silver) / 1_000.0
+
+        ndpi_detail = pd.DataFrame(
+            {
+                "ndpi_gold": gold_tax,
+                "ndpi_silver": silver_tax,
+                "ndpi_total": gold_tax + silver_tax,
+            },
+            index=periods,
+        )
+        self._ndpi_detail = ndpi_detail
+        return ndpi_detail.copy()
+
+    def _calc_property_tax_detail(self) -> pd.DataFrame:
+        """Return property-tax detail derived from CAPEX and depreciation."""
+
+        if self._property_tax_detail is not None:
+            return self._property_tax_detail.copy()
+
+        capex = self.calc_capex()
+        depreciation = self.inputs.depreciation.reindex(self.period_index).fillna(0.0)
+        rate_series = self.inputs.tax_parameters.property_tax_rate.reindex(self.period_index).fillna(0.0)
+
+        additions = capex.clip(lower=0.0)
+        disposals = (-capex).clip(lower=0.0)
+        opening_values: list[float] = []
+        closing_values: list[float] = []
+        base_values: list[float] = []
+
+        opening = 0.0
+        for period in self.period_index:
+            opening_values.append(opening)
+            add = additions.loc[period]
+            dispose = disposals.loc[period]
+            average_base = opening + 0.5 * add - 0.5 * dispose
+            base_values.append(max(average_base, 0.0))
+            closing = opening + add - dispose - depreciation.loc[period]
+            closing = max(closing, 0.0)
+            closing_values.append(closing)
+            opening = closing
+
+        property_tax_base = pd.Series(base_values, index=self.period_index)
+        property_tax = property_tax_base * rate_series
+        detail = pd.DataFrame(
+            {
+                "property_tax": property_tax,
+                "property_tax_base": property_tax_base,
+                "nbv_opening": pd.Series(opening_values, index=self.period_index),
+                "nbv_closing": pd.Series(closing_values, index=self.period_index),
+            },
+            index=self.period_index,
+        )
+        self._property_tax_detail = detail
+        return detail.copy()
+
     def calc_revenue(self) -> pd.Series:
         """
         Compute commodity revenue per period before taxes and investments.
 
         Returns:
             pd.Series: Revenue in thousand RUB (positive = inflow) derived from
-            ore mined, grades, recoveries, and RUB-per-gram prices held in
-            `ModelInputs.production` and `ModelInputs.prices`.
+            ore mined, grades, recoveries, and RUB-per-gram prices. The
+            computation keeps prices in RUB/gram and only converts to thousand
+            RUB after applying pricing to metal grams to align with the cash-flow
+            convention used throughout the model.
         """
+
+        detail = self.calc_revenue_detail()
+        revenue = detail["total_revenue_thousand"].copy()
+        revenue.name = "revenue"
+        return revenue
 
         production = self.inputs.production
         prices = self.inputs.prices
@@ -247,88 +369,57 @@ class MineProjectModel:
 
     def calc_taxes_detailed(self) -> pd.DataFrame:
         """
-        Compute detailed tax components using EBIT and a single loss pool.
+        Compute detailed tax components under the selected detailed mode.
 
-        Taxable profit is derived strictly from Periodic EBIT less the loss pool,
-        both computed within the Python model; Excel-derived profit/taxable/loss
-        sequences serve only as reconciliation controls in `check_against_excel()`.
-        Mineral and property taxes continue to mirror the FEM.xlsx series.
-        All tax values are reported in thousand RUB with positive numbers
-        representing cash paid to the authorities.
+        Modes:
+            - "standard_loss_pool" / "detailed": classic single loss-pool rule
+              where taxable profit equals EBIT less the accumulated losses.
+            - "excel_cumulative": Excel-style rule that taxes only increases in
+              the positive portion of cumulative profit (per the FEM workbook
+              note). In both cases mineral/property taxes continue to mirror the
+              input series, and Excel outputs remain reconciliation-only.
 
         Returns:
             pd.DataFrame: Columns for profit, mineral, and property taxes plus
             diagnostic EBIT/tax-base data (thousand RUB; positive = outflow).
         """
 
-        if self._tax_detail is not None:
-            return self._tax_detail.copy()
+        detailed_mode = (
+            "standard_loss_pool" if self.taxes_mode in {"detailed", "standard_loss_pool"} else self.taxes_mode
+        )
+        if detailed_mode in self._tax_detail:
+            return self._tax_detail[detailed_mode].copy()
 
-        revenue = self.calc_revenue()
+        revenue_detail = self.calc_revenue_detail()
+        revenue = revenue_detail["total_revenue_thousand"]
         opex_total = self.calc_costs()
         depreciation = self.inputs.depreciation.reindex(self.period_index).fillna(0.0)
+        capex = self.calc_capex()
 
-        ebit = revenue - opex_total - depreciation
-        profit_tax_rate = self.inputs.profit_tax_rate
-
-        loss_pool = 0.0
-        profit_tax_values: list[float] = []
-        taxable_profit_values: list[float] = []
-        loss_pool_carry: list[float] = []
-
-        for value in ebit.values:
-            taxable_profit = value - loss_pool
-            taxable_profit_values.append(taxable_profit)
-            if taxable_profit > 0.0:
-                profit_tax = taxable_profit * profit_tax_rate
-                loss_pool = 0.0
-            else:
-                profit_tax = 0.0
-                loss_pool = -taxable_profit
-            profit_tax_values.append(profit_tax)
-            loss_pool_carry.append(loss_pool)
-
-        profit_tax_series = pd.Series(
-            profit_tax_values, index=self.period_index, name="profit_tax"
-        )
-        taxable_profit_series = pd.Series(
-            taxable_profit_values, index=self.period_index, name="taxable_profit"
-        )
-        loss_pool_series = pd.Series(
-            loss_pool_carry, index=self.period_index, name="loss_pool_carry"
+        tax_engine = TaxEngine(
+            period_index=self.period_index,
+            tax_params=self.inputs.tax_parameters,
+            profit_tax_rate=self.inputs.profit_tax_rate,
+            loss_mode=detailed_mode,
         )
 
-        mineral_tax_series = (
-            self.inputs.excel_taxes["mineral_extraction_tax"]
-            .reindex(self.period_index)
-            .fillna(0.0)
-        )  # TODO: replace with mineral tax calculation from production drivers.
-        property_tax_series = (
-            self.inputs.excel_taxes["property_tax"]
-            .reindex(self.period_index)
-            .fillna(0.0)
-        )  # TODO: replace with property tax calculation from asset base.
+        interest_expense: Optional[pd.Series] = None
+        if self.inputs.tax_parameters.interest_tax_deductible and self.inputs.financing is not None:
+            interest_expense = self.calc_financing_schedule()["interest_expense"]
 
-        total_tax_series = (
-            profit_tax_series
-            + mineral_tax_series
-            + property_tax_series
+        ndpi_detail = self._calc_ndpi_detail()
+        property_detail = self._calc_property_tax_detail()
+        tax_detail = tax_engine.calculate(
+            revenue_detail=revenue_detail,
+            operating_costs=opex_total,
+            depreciation=depreciation,
+            capex=capex,
+            interest_expense=interest_expense,
+            ndpi_detail=ndpi_detail,
+            property_detail=property_detail,
         )
 
-        tax_detail = pd.DataFrame(
-            {
-                "profit_tax": profit_tax_series,
-                "mineral_extraction_tax": mineral_tax_series,
-                "property_tax": property_tax_series,
-                "total_tax": total_tax_series,
-                "depreciation": depreciation,
-                "ebit": ebit,
-                "taxable_profit": taxable_profit_series,
-                "loss_pool_carry": loss_pool_series,
-            },
-            index=self.period_index,
-        )
-        self._tax_detail = tax_detail
+        self._tax_detail[detailed_mode] = tax_detail
         return tax_detail.copy()
 
     def calc_taxes(self):
@@ -362,7 +453,7 @@ class MineProjectModel:
         working_capital = self.calc_working_capital()
 
         if isinstance(taxes, pd.DataFrame):
-            tax_series = taxes["total_tax"]
+            tax_series = taxes["profit_tax"]
         else:
             tax_series = taxes
 
@@ -528,6 +619,12 @@ class MineProjectModel:
             self._financing_schedule = schedule
             return schedule.copy()
 
+        mode = getattr(financing, "financing_mode", "synthetic")
+        if mode == "excel":
+            schedule = self._build_excel_financing_schedule(financing)
+            self._financing_schedule = schedule
+            return schedule.copy()
+
         debt_share = float(np.clip(financing.debt_ratio, 0.0, 1.0))
         total_need = float(funding_need.sum())
         remaining_capacity = (
@@ -638,6 +735,29 @@ class MineProjectModel:
 
         self._financing_schedule = schedule
         return schedule.copy()
+
+    def _build_excel_financing_schedule(self, financing: FinancingInputs) -> pd.DataFrame:
+        """Return the financing schedule directly from Excel reference series."""
+
+        periods = self.period_index
+        debt_closing = financing.excel_debt_balance.reindex(periods).fillna(0.0)
+        debt_draw = financing.excel_debt_draw.reindex(periods).fillna(0.0)
+        debt_repayment = financing.excel_debt_repayment.reindex(periods).fillna(0.0)
+        interest_expense = financing.excel_interest_expense.reindex(periods).fillna(0.0)
+        equity_injection = financing.excel_equity_injection.reindex(periods).fillna(0.0)
+        debt_opening = debt_closing.shift(1, fill_value=0.0)
+
+        return pd.DataFrame(
+            {
+                "debt_opening": debt_opening,
+                "debt_draw": debt_draw,
+                "debt_repayment": debt_repayment,
+                "debt_closing": debt_closing,
+                "interest_expense": interest_expense,
+                "equity_injection": equity_injection,
+            },
+            index=periods,
+        )
 
     def calc_levered_cashflow(self) -> pd.Series:
         """
@@ -866,32 +986,58 @@ class MineProjectModel:
                 )
             )
 
-        for period in periods:
-            records.append(
-                self._reconciliation_record(
-                    metric="tax_debug",
-                    subcategory="taxable_profit",
-                    period=period,
-                    excel_value=excel_taxable_profit.loc[period],
-                    python_value=taxes_python.at[period, "taxable_profit"],
+        if "taxable_profit" in taxes_python.columns:
+            for period in periods:
+                records.append(
+                    self._reconciliation_record(
+                        metric="tax_debug",
+                        subcategory="taxable_profit",
+                        period=period,
+                        excel_value=excel_taxable_profit.loc[period],
+                        python_value=taxes_python.at[period, "taxable_profit"],
+                    )
                 )
-            )
 
-        for period in periods:
-            excel_value = (
-                excel_loss_pool.loc[period]
-                if loss_pool_available
-                else np.nan
-            )
-            records.append(
-                self._reconciliation_record(
-                    metric="tax_debug",
-                    subcategory="loss_pool",
-                    period=period,
-                    excel_value=excel_value,
-                    python_value=taxes_python.at[period, "loss_pool_carry"],
+        if "loss_pool_carry" in taxes_python.columns:
+            for period in periods:
+                excel_value = (
+                    excel_loss_pool.loc[period]
+                    if loss_pool_available
+                    else np.nan
                 )
-            )
+                records.append(
+                    self._reconciliation_record(
+                        metric="tax_debug",
+                        subcategory="loss_pool",
+                        period=period,
+                        excel_value=excel_value,
+                        python_value=taxes_python.at[period, "loss_pool_carry"],
+                    )
+                )
+
+        if "taxable_profit_excel_rule" in taxes_python.columns:
+            for period in periods:
+                records.append(
+                    self._reconciliation_record(
+                        metric="tax_debug",
+                        subcategory="taxable_profit_excel_rule",
+                        period=period,
+                        excel_value=np.nan,
+                        python_value=taxes_python.at[period, "taxable_profit_excel_rule"],
+                    )
+                )
+
+        if "cumulative_profit_excel_rule" in taxes_python.columns:
+            for period in periods:
+                records.append(
+                    self._reconciliation_record(
+                        metric="tax_debug",
+                        subcategory="cumulative_profit_excel_rule",
+                        period=period,
+                        excel_value=np.nan,
+                        python_value=taxes_python.at[period, "cumulative_profit_excel_rule"],
+                    )
+                )
 
         financing_inputs = self.inputs.financing
         if financing_inputs is not None:

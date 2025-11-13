@@ -122,6 +122,26 @@ class FinancingInputs:
     excel_debt_balance: pd.Series
     excel_interest_expense: pd.Series
     excel_equity_injection: pd.Series
+    financing_mode: str = "excel"
+
+
+@dataclass
+class TaxParameters:
+    """
+    Configuration for statutory taxes driven by FEM inputs.
+
+    Rates are stored as decimal values (e.g. 0.06 == 6%) and series are aligned
+    to the model period index to enable straightforward scenario overrides.
+    """
+
+    ndpi_rate_gold: pd.Series
+    ndpi_rate_silver: pd.Series
+    property_tax_rate: pd.Series
+    ndpi_deductible_before_profit_tax: bool = False
+    property_tax_deductible_before_profit_tax: bool = False
+    interest_tax_deductible: bool = False
+    loss_carry_mode: str = "excel_cumulative"
+    profit_taxable_adjustment: Optional[pd.Series] = None
 
 
 @dataclass
@@ -139,6 +159,7 @@ class ModelInputs:
     depreciation: pd.Series
     discount_rate: float
     profit_tax_rate: float
+    tax_parameters: TaxParameters
     scenario: str
     power_mode: str
     power_inputs: Optional[PowerInputs]
@@ -169,6 +190,7 @@ class ModelInputs:
             "depreciation": self.depreciation.copy(),
             "discount_rate": self.discount_rate,
             "profit_tax_rate": self.profit_tax_rate,
+            "tax_parameters": self.tax_parameters,
             "scenario": self.scenario,
             "power_mode": self.power_mode,
             "power_inputs": self.power_inputs,
@@ -237,6 +259,16 @@ def load_model_inputs(excel_path: Optional[Path] = None) -> ModelInputs:
     )
     excel_profit_loss_period = tax_data["profit_loss_period"]
     excel_profit_loss_cumulative = tax_data["profit_loss_cumulative"]
+    tax_parameters = _load_tax_parameters(
+        inputs_sheet, period_index, value_columns
+    )
+    profit_tax_adjustment = _calculate_profit_tax_adjustment(
+        cashflow_data["revenue"],
+        cashflow_data["opex_total"],
+        tax_data["depreciation"],
+        excel_profit_loss_period,
+    )
+    tax_parameters.profit_taxable_adjustment = profit_tax_adjustment
     financing_inputs: Optional[FinancingInputs] = None
     financing_error = None
     try:
@@ -280,6 +312,7 @@ def load_model_inputs(excel_path: Optional[Path] = None) -> ModelInputs:
         depreciation=tax_data["depreciation"],
         discount_rate=discount_rate,
         profit_tax_rate=profit_tax_rate,
+        tax_parameters=tax_parameters,
         scenario=scenario,
         power_mode=power_mode,
         power_inputs=power_inputs,
@@ -746,6 +779,90 @@ def _load_tax_data(
     }
 
 
+def _load_tax_parameters(
+    inputs_sheet: pd.DataFrame,
+    period_index: pd.Index,
+    value_columns: Iterable[str],
+) -> TaxParameters:
+    """Return statutory tax settings derived from the inputs sheet."""
+
+    label_col = _normalized_column(inputs_sheet, "Unnamed: 3")
+
+    ndpi_gold = _normalize_rate_series(
+        _extract_series(
+            inputs_sheet,
+            label_col,
+            value_columns,
+            period_index,
+            "по ставке (золото)",
+            "%",
+        ).reindex(period_index).fillna(0.0)
+    )
+    ndpi_silver = _normalize_rate_series(
+        _extract_series(
+            inputs_sheet,
+            label_col,
+            value_columns,
+            period_index,
+            "по ставке (серебро)",
+            "%",
+        ).reindex(period_index).fillna(0.0)
+    )
+    property_tax_rate = _normalize_rate_series(
+        _extract_series(
+            inputs_sheet,
+            label_col,
+            value_columns,
+            period_index,
+            "Налог на имущество",
+        ).reindex(period_index).fillna(0.0)
+    )
+
+    return TaxParameters(
+        ndpi_rate_gold=ndpi_gold,
+        ndpi_rate_silver=ndpi_silver,
+        property_tax_rate=property_tax_rate,
+    )
+
+
+def _calculate_profit_tax_adjustment(
+    revenue: pd.Series,
+    opex_total: pd.Series,
+    depreciation: pd.Series,
+    excel_profit_loss_period: pd.Series,
+) -> pd.Series:
+    """
+    Derive any residual adjustments between modeled EBIT and Excel profit rows.
+
+    Excel's tax sheet embeds start-up adjustments that are not part of the
+    structured OPEX inputs. Capturing the delta here allows the Python model to
+    reproduce the Excel taxable base while still exposing the adjustments as a
+    dedicated series for future scenario control.
+    """
+
+    revenue = revenue.reindex(excel_profit_loss_period.index).fillna(0.0)
+    opex_total = opex_total.reindex(excel_profit_loss_period.index).fillna(0.0)
+    depreciation = depreciation.reindex(excel_profit_loss_period.index).fillna(0.0)
+    modeled_profit = revenue - opex_total - depreciation
+    adjustment = excel_profit_loss_period.reindex(modeled_profit.index).fillna(0.0) - modeled_profit
+    adjustment.name = "profit_taxable_adjustment"
+    return adjustment
+
+
+def _normalize_rate_series(series: pd.Series) -> pd.Series:
+    """
+    Ensure percentage-like inputs are stored as decimal fractions.
+
+    FEM.xlsx records some rates in %, others already as decimals. This helper
+    harmonises them by dividing by 100 whenever values exceed 1.0 in magnitude.
+    """
+
+    normalized = series.astype(float).copy()
+    mask = normalized.abs() > 1.0
+    normalized.loc[mask] = normalized.loc[mask] / 100.0
+    return normalized.fillna(0.0)
+
+
 def _load_financing_inputs(
     financing_sheet: pd.DataFrame,
     period_index: pd.Index,
@@ -829,6 +946,7 @@ def _load_financing_inputs(
         excel_debt_balance=debt_balance,
         excel_interest_expense=interest_expense,
         excel_equity_injection=equity_injection,
+        financing_mode="excel",
     )
 
 

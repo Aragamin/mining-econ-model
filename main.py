@@ -1,13 +1,17 @@
 from __future__ import annotations
 
+import argparse
+
 import pandas as pd
 
-from model_inputs import load_model_inputs
+from interface_utils import parse_optional_float_list, parse_optional_str_list
+from model_inputs import ModelInputs, load_model_inputs
 from project_model import MineProjectModel
+from sensitivity import run_scenarios
 
 
-def main() -> None:
-    inputs = load_model_inputs()
+def _run_base_case(inputs: ModelInputs) -> None:
+    """Execute the base-case report with unlevered/levered KPIs and checks."""
     model = MineProjectModel(inputs)
 
     unlevered_cf = model.calc_unlevered_cashflow()
@@ -35,30 +39,32 @@ def main() -> None:
     print()
 
     reconciliation = model.check_against_excel()
-    worst_abs_row = reconciliation.loc[reconciliation["diff_abs"].idxmax()]
-    worst_abs = {
-        "metric": worst_abs_row["metric"],
-        "subcategory": worst_abs_row["subcategory"],
-        "period": int(worst_abs_row["period"]),
-        "excel_value": round(float(worst_abs_row["excel_value"]), 2),
-        "python_value": round(float(worst_abs_row["python_value"]), 2),
-        "diff_abs": round(float(worst_abs_row["diff_abs"]), 2),
-    }
+    core_recon = reconciliation[reconciliation["metric"] != "financing"]
+    fin_recon = reconciliation[reconciliation["metric"] == "financing"]
 
-    pct_series = reconciliation["diff_pct"].abs().dropna()
-    worst_pct = None
-    if not pct_series.empty:
-        worst_pct_row = reconciliation.loc[pct_series.idxmax()]
-        worst_pct = {
-            "metric": worst_pct_row["metric"],
-            "subcategory": worst_pct_row["subcategory"],
-            "period": int(worst_pct_row["period"]),
-            "excel_value": round(float(worst_pct_row["excel_value"]), 2),
-            "python_value": round(float(worst_pct_row["python_value"]), 2),
-            "diff_pct": round(float(worst_pct_row["diff_pct"]) * 100.0, 2),
+    def _format_row(row: pd.Series, include_pct: bool = True) -> dict[str, float | str | None]:
+        return {
+            "metric": row["metric"],
+            "subcategory": row["subcategory"],
+            "period": int(row["period"]),
+            "excel_value": round(float(row["excel_value"]), 2),
+            "python_value": round(float(row["python_value"]), 2),
+            "diff_abs": round(float(row["diff_abs"]), 2),
+            "diff_pct": (
+                round(float(row["diff_pct"]) * 100.0, 2)
+                if include_pct and not pd.isna(row["diff_pct"])
+                else None
+            ),
         }
 
-    tax_rows = reconciliation[reconciliation["metric"] == "tax"]
+    core_abs = core_pct = None
+    if not core_recon.empty:
+        core_abs = _format_row(core_recon.loc[core_recon["diff_abs"].abs().idxmax()], include_pct=False)
+        pct_series = core_recon["diff_pct"].abs().dropna()
+        if not pct_series.empty:
+            core_pct = _format_row(core_recon.loc[pct_series.idxmax()])
+
+    tax_rows = core_recon[core_recon["metric"] == "tax"]
     worst_tax = None
     if not tax_rows.empty:
         worst_tax_row = tax_rows.loc[tax_rows["diff_abs"].idxmax()]
@@ -74,6 +80,10 @@ def main() -> None:
                 else None
             ),
         }
+    fin_abs = None
+    if not fin_recon.empty:
+        fin_abs = _format_row(fin_recon.loc[fin_recon["diff_abs"].abs().idxmax()], include_pct=False)
+
     tax_debug_sample = None
     if worst_tax is not None:
         tax_period = worst_tax["period"]
@@ -100,12 +110,15 @@ def main() -> None:
                 ),
             }
 
-    print("Reconciliation spot checks:")
-    print(f"  Largest absolute deviation: {worst_abs}")
-    if worst_pct is not None:
-        print(f"  Largest percentage deviation: {worst_pct}")
+    print("Reconciliation spot checks (core model excluding financing):")
+    if core_abs is not None:
+        print(f"  Largest absolute deviation: {core_abs}")
     else:
-        print("  Largest percentage deviation: n/a (no non-zero Excel values)")
+        print("  Largest absolute deviation: n/a (no core deviations)")
+    if core_pct is not None:
+        print(f"  Largest percentage deviation: {core_pct}")
+    else:
+        print("  Largest percentage deviation: n/a (no non-zero core deviations)")
     if worst_tax is not None:
         print(f"  Largest tax deviation: {worst_tax}")
         if tax_debug_sample is not None:
@@ -114,6 +127,73 @@ def main() -> None:
             print("  Tax debug sample: n/a (no debug rows for that period)")
     else:
         print("  Largest tax deviation: n/a (no tax rows)")
+    # Financing rows are separated because FEM.xlsx has no debt schedule; large differences are expected.
+    print("Financing deviations (Python schedule vs Excel financing inputs):")
+    if fin_abs is not None:
+        print(f"  Largest financing deviation: {fin_abs}")
+    else:
+        print("  Largest financing deviation: n/a (no financing rows)")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Mine project model runner.")
+    parser.add_argument(
+        "--scenario-grid",
+        action="store_true",
+        help="Run scenario grid instead of the single base case.",
+    )
+    parser.add_argument(
+        "--price-mults",
+        help="Comma-separated price multipliers (e.g. 0.9,1.0,1.1).",
+    )
+    parser.add_argument(
+        "--opex-mults",
+        help="Optional comma-separated OPEX multipliers (defaults to 1.0).",
+    )
+    parser.add_argument(
+        "--power-modes",
+        help="Optional comma-separated power modes (purchase,selfgen).",
+    )
+    parser.add_argument(
+        "--levered",
+        action="store_true",
+        help="Include levered KPIs when running the scenario grid.",
+    )
+    parser.add_argument(
+        "--discount-rate",
+        type=float,
+        default=None,
+        help="Override discount rate for scenario KPIs (decimal, e.g. 0.15).",
+    )
+
+    args = parser.parse_args()
+
+    inputs = load_model_inputs()
+
+    if not args.scenario_grid:
+        _run_base_case(inputs)
+        return
+
+    try:
+        price_mults = parse_optional_float_list(args.price_mults, "price-mults") or [1.0]
+        opex_mults = parse_optional_float_list(args.opex_mults, "opex-mults")
+    except ValueError as exc:
+        parser.error(str(exc))
+    power_modes = parse_optional_str_list(args.power_modes)
+
+    scenario_df = run_scenarios(
+        base_inputs=inputs,
+        price_multipliers=price_mults,
+        opex_multipliers=opex_mults,
+        power_modes=power_modes,
+        use_levered=args.levered,
+        discount_rate_override=args.discount_rate,
+    )
+    if scenario_df.empty:
+        print("No scenarios were generated.")
+        return
+    print("Scenario grid results (NPV in thousand RUB, IRR decimal):")
+    print(scenario_df.to_string(index=False))
 
 
 if __name__ == "__main__":
